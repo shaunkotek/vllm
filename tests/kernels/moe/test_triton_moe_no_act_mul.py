@@ -9,13 +9,31 @@ equals N (not N // 2 like gated activations).
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from tests.kernels.moe.utils import make_dummy_moe_config
+from vllm import _custom_ops as ops
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    RoutingMethodType,
+    fp8_w8a8_moe_quant_config,
 )
-from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    TritonExperts,
+    fused_experts,
+)
+from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEActivationFormat,
+    FusedMoEExperts,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8DynamicTokenSym,
+    kFp8StaticChannelSym,
+)
 from vllm.platforms import current_platform
 
 # Test parameters
@@ -209,3 +227,174 @@ def test_adjust_n_for_activation():
     assert experts.adjust_N_for_activation(N, MoEActivation.SILU_NO_MUL) == N
     assert experts.adjust_N_for_activation(N, MoEActivation.GELU_NO_MUL) == N
     assert experts.adjust_N_for_activation(N, MoEActivation.RELU2_NO_MUL) == N
+
+
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(89),
+    reason="FP8 requires compute capability >= 8.9",
+)
+@pytest.mark.parametrize(
+    "activation",
+    [MoEActivation.SILU_NO_MUL, MoEActivation.GELU_NO_MUL, MoEActivation.RELU2_NO_MUL],
+)
+def test_triton_experts_supports_fp8_no_mul(activation):
+    """Test that TritonExperts reports support for FP8 non-gated configs."""
+    moe_config = FusedMoEConfig(
+        num_experts=NUM_EXPERTS,
+        experts_per_token=2,
+        hidden_dim=128,
+        intermediate_size_per_partition=256,
+        num_local_experts=NUM_EXPERTS,
+        num_logical_experts=NUM_EXPERTS,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        activation=activation,
+        in_dtype=torch.bfloat16,
+        device="cuda",
+        routing_method=RoutingMethodType.TopK,
+        is_act_and_mul=False,
+    )
+    supported, reason = FusedMoEExperts.is_supported_config(
+        TritonExperts,
+        moe_config,
+        weight_key=kFp8StaticChannelSym,
+        activation_key=kFp8DynamicTokenSym,
+        activation_format=FusedMoEActivationFormat.Standard,
+    )
+    assert supported, (
+        f"TritonExperts should support FP8 non-gated {activation}: {reason}"
+    )
+
+
+TORCH_ACTIVATION_FN = {
+    MoEActivation.SILU_NO_MUL: F.silu,
+    MoEActivation.GELU_NO_MUL: F.gelu,
+    MoEActivation.RELU2_NO_MUL: lambda x: F.relu(x).square(),
+}
+
+
+def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype):
+    """Per-token input scale, per-channel weight scale matmul."""
+    A = A.to(torch.float32)
+    B = B.to(torch.float32).t()
+    C = torch.matmul(A, B)
+    C = As * C * Bs.view(1, -1)
+    return C.to(output_dtype)
+
+
+def fp8_mask(a, mask):
+    dtype = a.dtype
+    return a.view(torch.int8)[mask].view(dtype)
+
+
+def torch_w8a8_per_column_moe_no_gate(
+    a,
+    w1,
+    w2,
+    w1_s,
+    w2_s,
+    topk_weights,
+    topk_ids,
+    activation_fn,
+):
+    """Reference non-gated FP8 MoE using native torch."""
+    B, D = a.shape
+    topk = topk_ids.shape[1]
+
+    a_q, a_s = ops.scaled_fp8_quant(a, use_per_token_if_dynamic=True)
+    a_q = a_q.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+    a_s = a_s.view(B, -1, 1).repeat(1, topk, 1).reshape(-1, 1)
+
+    out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
+    flat_ids = topk_ids.view(-1)
+
+    for i in range(w1.shape[0]):
+        mask = flat_ids == i
+        if mask.sum():
+            inter_out = native_w8a8_per_token_matmul(
+                fp8_mask(a_q, mask),
+                w1[i],
+                fp8_mask(a_s, mask),
+                w1_s[i],
+                output_dtype=a.dtype,
+            )
+            act_out = activation_fn(inter_out)
+            act_out_q, act_out_s = ops.scaled_fp8_quant(
+                act_out,
+                use_per_token_if_dynamic=True,
+            )
+            out[mask] = native_w8a8_per_token_matmul(
+                act_out_q,
+                w2[i],
+                act_out_s,
+                w2_s[i],
+                output_dtype=a.dtype,
+            )
+
+    return (
+        out.view(B, -1, w2.shape[1]) * topk_weights.view(B, -1, 1).to(out.dtype)
+    ).sum(dim=1)
+
+
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(89),
+    reason="FP8 requires compute capability >= 8.9",
+)
+@pytest.mark.parametrize("m", [1, 33])
+@pytest.mark.parametrize("n", [128, 256])
+@pytest.mark.parametrize("k", [128, 256])
+@pytest.mark.parametrize("topk", [2])
+@pytest.mark.parametrize(
+    "activation",
+    [MoEActivation.SILU_NO_MUL, MoEActivation.GELU_NO_MUL, MoEActivation.RELU2_NO_MUL],
+)
+@torch.inference_mode()
+def test_triton_experts_no_mul_fp8(m, n, k, topk, activation):
+    dtype = torch.bfloat16
+    e = NUM_EXPERTS
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max, fp8_min = finfo.max, finfo.min
+    factor_for_scale = 1e-2
+
+    a = torch.randn((m, k), dtype=dtype, device="cuda") / 10
+
+    w1_fp32 = (torch.rand((e, n, k), dtype=torch.float32, device="cuda") - 0.5) * 0.1
+    w1 = (w1_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+
+    w2_fp32 = (torch.rand((e, k, n), dtype=torch.float32, device="cuda") - 0.5) * 0.1
+    w2 = (w2_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+
+    w1_s = torch.rand(e, n, device="cuda") * factor_for_scale
+    w2_s = torch.rand(e, k, device="cuda") * factor_for_scale
+
+    score = torch.randn((m, e), dtype=dtype, device="cuda")
+    topk_weights = torch.softmax(score, dim=-1, dtype=torch.float32)
+    topk_weights, topk_ids = torch.topk(topk_weights, topk)
+
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        ref_out = torch_w8a8_per_column_moe_no_gate(
+            a,
+            w1,
+            w2,
+            w1_s,
+            w2_s,
+            topk_weights,
+            topk_ids,
+            activation_fn=TORCH_ACTIVATION_FN[activation],
+        )
+        out = fused_experts(
+            a,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            quant_config=fp8_w8a8_moe_quant_config(
+                per_act_token_quant=True,
+                w1_scale=w1_s,
+                w2_scale=w2_s,
+                block_shape=None,
+            ),
+        )
+
+    torch.testing.assert_close(out, ref_out, atol=0.1, rtol=0.05)

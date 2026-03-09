@@ -7,6 +7,8 @@ silu_no_mul, gelu_no_mul, relu2_no_mul where the activation output dimension
 equals N (not N // 2 like gated activations).
 """
 
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -370,6 +372,15 @@ def test_triton_experts_no_mul_fp8(m, n, k, topk, activation):
     topk_weights = torch.softmax(score, dim=-1, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(topk_weights, topk)
 
+    import vllm.model_executor.layers.fused_moe.fused_moe as fused_moe_module
+
+    _real_kernel = fused_moe_module.invoke_fused_moe_triton_kernel
+    kernel_call_count = []
+
+    def spy_kernel(*args, **kwargs):
+        kernel_call_count.append(1)
+        return _real_kernel(*args, **kwargs)
+
     vllm_config = VllmConfig()
     with set_current_vllm_config(vllm_config):
         ref_out = torch_w8a8_per_column_moe_no_gate(
@@ -382,19 +393,29 @@ def test_triton_experts_no_mul_fp8(m, n, k, topk, activation):
             topk_ids,
             activation_fn=TORCH_ACTIVATION_FN[activation],
         )
-        out = fused_experts(
-            a,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            activation=activation,
-            quant_config=fp8_w8a8_moe_quant_config(
-                per_act_token_quant=True,
-                w1_scale=w1_s,
-                w2_scale=w2_s,
-                block_shape=None,
-            ),
-        )
 
+        # use fused_experts and not TritonExperts since TritonExperts do not perform
+        # the support check. use spy to make sure the triton kernel is actually called.
+        with patch.object(
+            fused_moe_module, "invoke_fused_moe_triton_kernel", spy_kernel
+        ):
+            out = fused_experts(
+                a,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation=activation,
+                quant_config=fp8_w8a8_moe_quant_config(
+                    per_act_token_quant=True,
+                    w1_scale=w1_s,
+                    w2_scale=w2_s,
+                    block_shape=None,
+                ),
+            )
+
+    assert len(kernel_call_count) == 2, (
+        f"Expected invoke_fused_moe_triton_kernel to be called twice "
+        f"(w1 and w2 matmuls), got {len(kernel_call_count)}"
+    )
     torch.testing.assert_close(out, ref_out, atol=0.1, rtol=0.05)

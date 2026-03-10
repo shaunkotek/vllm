@@ -171,22 +171,24 @@ def test_load_first_nemotron_h_moe_layer_as_single_layer_model(tmp_path, dist_in
         )
 
 
-@pytest.mark.optional
 @pytest.mark.parametrize(
-    "model_checkpoint", ["nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"]
+    "model_checkpoint",
+    [
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    ],
 )
 def test_real_nemotron_first_moe_layer_forward(
     dist_init, workspace_init, model_checkpoint: str, monkeypatch: pytest.MonkeyPatch
 ):
-    # monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP8", "0")
-    # monkeypatch.setenv("VLLM_USE_DEEP_GEMM", "0")
-    # monkeypatch.setenv("VLLM_MOE_USE_DEEP_GEMM", "0")
+    if ("NVFP4" in model_checkpoint) and not current_platform.supports_nvfp4:
+        pytest.skip("Skipping test because NVFP4 is not supported on this platform")
 
     try:
         result = load_first_nemotron_h_moe_layer_as_single_layer_model(
             model_checkpoint,
             trust_remote_code=True,
-            # moe_backend="flashinfer_cutlass",
         )
     except Exception as exc:
         if isinstance(

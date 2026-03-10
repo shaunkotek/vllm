@@ -179,11 +179,20 @@ def test_load_first_nemotron_h_moe_layer_as_single_layer_model(tmp_path, dist_in
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
     ],
 )
+@pytest.mark.parametrize(
+    "backend", ["flashinfer-latency", "flashinfer-throughput", "triton", "marlin"]
+)
 def test_real_nemotron_first_moe_layer_forward(
-    dist_init, workspace_init, model_checkpoint: str, monkeypatch: pytest.MonkeyPatch
+    dist_init,
+    workspace_init,
+    model_checkpoint: str,
+    backend: str,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     if ("NVFP4" in model_checkpoint) and not current_platform.supports_nvfp4:
         pytest.skip("Skipping test because NVFP4 is not supported on this platform")
+
+    _set_envs_for_backend(backend, monkeypatch)
 
     try:
         result = load_first_nemotron_h_moe_layer_as_single_layer_model(
@@ -227,3 +236,24 @@ def test_real_nemotron_first_moe_layer_forward(
     assert output.shape == hidden_states.shape
     assert torch.isfinite(output).all()
     assert not torch.all(output == 0)
+
+
+def _set_envs_for_backend(backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    if backend == "flashinfer-latency":
+        monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP4", "1")
+        monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP8", "1")
+        monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP16", "1")
+        monkeypatch.setenv("VLLM_FLASHINFER_MOE_BACKEND", "latency")
+    elif backend == "flashinfer-throughput":
+        monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP4", "1")
+        monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP8", "1")
+        monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP16", "1")
+        monkeypatch.setenv("VLLM_FLASHINFER_MOE_BACKEND", "throughput")
+    elif backend == "triton":
+        monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP4", "0")
+        monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP8", "0")
+        monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP16", "0")
+    elif backend == "marlin":
+        pytest.skip("Marlin backend is not supported in CI yet.")
+    else:
+        raise ValueError(f"Unsupported backend: {backend}")

@@ -11,7 +11,7 @@ import os
 import tempfile
 import time
 from collections import defaultdict
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Any
@@ -21,7 +21,12 @@ import huggingface_hub.constants
 import numpy as np
 import regex as re
 import torch
-from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub import (
+    HfFileSystem,
+    get_safetensors_metadata,
+    hf_hub_download,
+    snapshot_download,
+)
 from safetensors.torch import load, load_file, safe_open, save_file
 from tqdm.auto import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
@@ -58,6 +63,7 @@ except ImportError:
     SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
+from vllm.transformers_utils.utils import parse_safetensors_file_metadata
 
 logger = init_logger(__name__)
 
@@ -599,6 +605,198 @@ def download_safetensors_index_file_from_hf(
             logger.info("No %s found in local cache.", index_file)
         except huggingface_hub.utils.EntryNotFoundError:
             logger.info("No %s found in remote.", index_file)
+
+
+def _load_safetensors_weight_map_from_index(
+    index_path: str | Path,
+) -> dict[str, str]:
+    with open(index_path) as f:
+        index_data = json.load(f)
+
+    weight_map = index_data.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise ValueError(f"Invalid safetensors index file: {index_path}")
+
+    return {
+        str(weight_name): str(filename) for weight_name, filename in weight_map.items()
+    }
+
+
+def _get_local_safetensors_weight_map(
+    model_path: str | Path,
+) -> dict[str, str]:
+    model_path = Path(model_path)
+    index_path = model_path / SAFE_WEIGHTS_INDEX_NAME
+    if index_path.is_file():
+        return _load_safetensors_weight_map_from_index(index_path)
+
+    weight_map: dict[str, str] = {}
+    for safetensors_file in sorted(model_path.rglob("*.safetensors")):
+        if not safetensors_file.is_file():
+            continue
+        rel_path = str(safetensors_file.relative_to(model_path))
+        for tensor_name in parse_safetensors_file_metadata(safetensors_file):
+            weight_map[tensor_name] = rel_path
+
+    return weight_map
+
+
+def _get_remote_safetensors_weight_map(
+    model_name_or_path: str,
+    *,
+    revision: str | None = None,
+    cache_dir: str | None = None,
+) -> dict[str, str]:
+    try:
+        index_path = hf_hub_download(
+            repo_id=model_name_or_path,
+            filename=SAFE_WEIGHTS_INDEX_NAME,
+            cache_dir=cache_dir,
+            revision=revision,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+    except (
+        huggingface_hub.utils.LocalEntryNotFoundError,
+        huggingface_hub.utils.EntryNotFoundError,
+    ):
+        index_path = None
+
+    if index_path is not None:
+        return _load_safetensors_weight_map_from_index(index_path)
+
+    repo_mt = get_safetensors_metadata(model_name_or_path, revision=revision)
+    if not repo_mt or not repo_mt.files_metadata:
+        return {}
+
+    weight_map: dict[str, str] = {}
+    for filename, file_metadata in repo_mt.files_metadata.items():
+        for tensor_name in file_metadata.tensors:
+            weight_map[tensor_name] = filename
+
+    return weight_map
+
+
+def get_safetensors_weight_map(
+    model_name_or_path: str,
+    *,
+    revision: str | None = None,
+    cache_dir: str | None = None,
+) -> dict[str, str]:
+    """Map tensor names to safetensors shard filenames."""
+    model_path = Path(model_name_or_path)
+    if model_path.exists():
+        return _get_local_safetensors_weight_map(model_path)
+
+    return _get_remote_safetensors_weight_map(
+        model_name_or_path,
+        revision=revision,
+        cache_dir=cache_dir,
+    )
+
+
+def resolve_safetensors_tensor_names(
+    model_name_or_path: str,
+    *,
+    tensor_names: Iterable[str] = (),
+    tensor_name_prefixes: Iterable[str] = (),
+    revision: str | None = None,
+    cache_dir: str | None = None,
+) -> tuple[set[str], dict[str, str]]:
+    """Resolve exact tensor names from explicit names and prefixes."""
+    weight_map = get_safetensors_weight_map(
+        model_name_or_path,
+        revision=revision,
+        cache_dir=cache_dir,
+    )
+    if not weight_map:
+        raise ValueError(
+            f"No safetensors metadata found for model '{model_name_or_path}'."
+        )
+
+    requested_names = set(tensor_names)
+    resolved_names = set(requested_names)
+
+    for prefix in tensor_name_prefixes:
+        resolved_names.update(
+            tensor_name for tensor_name in weight_map if tensor_name.startswith(prefix)
+        )
+
+    missing_names = sorted(name for name in requested_names if name not in weight_map)
+    if missing_names:
+        raise ValueError(
+            "Could not resolve requested tensor names from safetensors metadata: "
+            f"{missing_names}"
+        )
+
+    unmatched_prefixes = sorted(
+        prefix
+        for prefix in tensor_name_prefixes
+        if not any(name.startswith(prefix) for name in weight_map)
+    )
+    if unmatched_prefixes:
+        raise ValueError(
+            "Could not resolve requested tensor prefixes from safetensors metadata: "
+            f"{unmatched_prefixes}"
+        )
+
+    return resolved_names, weight_map
+
+
+def download_safetensors_subset_from_hf(
+    model_name_or_path: str,
+    *,
+    cache_dir: str | None,
+    tensor_names: Iterable[str] = (),
+    tensor_name_prefixes: Iterable[str] = (),
+    revision: str | None = None,
+    ignore_patterns: str | list[str] | None = None,
+) -> tuple[str, list[str], set[str]]:
+    """Download the minimal shard set covering the requested tensors.
+
+    Returns:
+        Tuple of `(hf_folder, local_shard_paths, resolved_tensor_names)`.
+    """
+    resolved_names, weight_map = resolve_safetensors_tensor_names(
+        model_name_or_path,
+        tensor_names=tensor_names,
+        tensor_name_prefixes=tensor_name_prefixes,
+        revision=revision,
+        cache_dir=cache_dir,
+    )
+
+    required_files = sorted({weight_map[name] for name in resolved_names})
+    model_path = Path(model_name_or_path)
+    if model_path.exists():
+        hf_folder = str(model_path)
+    else:
+        hf_folder = download_weights_from_hf(
+            model_name_or_path=model_name_or_path,
+            cache_dir=cache_dir,
+            allow_patterns=required_files,
+            revision=revision,
+            ignore_patterns=ignore_patterns,
+        )
+
+    local_weight_files = [
+        str(Path(hf_folder) / filename) for filename in required_files
+    ]
+    return hf_folder, local_weight_files, resolved_names
+
+
+def safetensors_subset_weights_iterator(
+    hf_weights_files: list[str],
+    tensor_names: set[str],
+    use_tqdm_on_load: bool,
+    safetensors_load_strategy: str = "lazy",
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over only the requested tensors from safetensors shards."""
+    for name, tensor in safetensors_weights_iterator(
+        hf_weights_files,
+        use_tqdm_on_load=use_tqdm_on_load,
+        safetensors_load_strategy=safetensors_load_strategy,
+    ):
+        if name in tensor_names:
+            yield name, tensor
 
 
 # For models like Mistral-7B-v0.3, there are both sharded

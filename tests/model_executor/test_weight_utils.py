@@ -6,12 +6,18 @@ import tempfile
 
 import huggingface_hub.constants
 import pytest
+import torch
 from huggingface_hub.utils import LocalEntryNotFoundError
+from safetensors.torch import save_file
 
 from vllm.model_executor.model_loader.weight_utils import (
+    download_safetensors_subset_from_hf,
     download_weights_from_hf,
     enable_hf_transfer,
+    get_safetensors_weight_map,
     maybe_remap_kv_scale_name,
+    resolve_safetensors_tensor_names,
+    safetensors_subset_weights_iterator,
 )
 
 
@@ -60,6 +66,89 @@ def test_download_weights_from_hf():
             )
             is not None
         )
+
+
+def test_resolve_safetensors_subset_from_local_index():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        shard1 = os.path.join(tmpdir, "model-00001-of-00002.safetensors")
+        shard2 = os.path.join(tmpdir, "model-00002-of-00002.safetensors")
+        save_file(
+            {
+                "model.layers.0.weight": torch.ones(2, 2),
+                "model.layers.0.bias": torch.ones(2),
+            },
+            shard1,
+        )
+        save_file(
+            {
+                "model.layers.1.weight": torch.zeros(2, 2),
+                "lm_head.weight": torch.zeros(2, 2),
+            },
+            shard2,
+        )
+        with open(os.path.join(tmpdir, "model.safetensors.index.json"), "w") as f:
+            f.write(
+                """{
+  "metadata": {"total_size": 0},
+  "weight_map": {
+    "model.layers.0.weight": "model-00001-of-00002.safetensors",
+    "model.layers.0.bias": "model-00001-of-00002.safetensors",
+    "model.layers.1.weight": "model-00002-of-00002.safetensors",
+    "lm_head.weight": "model-00002-of-00002.safetensors"
+  }
+}
+"""
+            )
+
+        weight_map = get_safetensors_weight_map(tmpdir)
+        assert weight_map["model.layers.0.weight"] == "model-00001-of-00002.safetensors"
+
+        resolved_names, resolved_weight_map = resolve_safetensors_tensor_names(
+            tmpdir,
+            tensor_name_prefixes=["model.layers.0."],
+        )
+        assert resolved_names == {
+            "model.layers.0.weight",
+            "model.layers.0.bias",
+        }
+        assert resolved_weight_map == weight_map
+
+        hf_folder, local_files, downloaded_names = download_safetensors_subset_from_hf(
+            tmpdir,
+            cache_dir=None,
+            tensor_name_prefixes=["model.layers.0."],
+        )
+        assert hf_folder == tmpdir
+        assert local_files == [shard1]
+        assert downloaded_names == resolved_names
+
+        loaded = dict(
+            safetensors_subset_weights_iterator(
+                local_files,
+                downloaded_names,
+                use_tqdm_on_load=False,
+            )
+        )
+        assert set(loaded) == resolved_names
+        assert torch.equal(loaded["model.layers.0.weight"], torch.ones(2, 2))
+
+
+def test_resolve_safetensors_tensor_names_missing_inputs():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        shard = os.path.join(tmpdir, "model.safetensors")
+        save_file({"model.layers.0.weight": torch.ones(1)}, shard)
+
+        with pytest.raises(ValueError, match="tensor names"):
+            resolve_safetensors_tensor_names(
+                tmpdir,
+                tensor_names=["missing.weight"],
+            )
+
+        with pytest.raises(ValueError, match="tensor prefixes"):
+            resolve_safetensors_tensor_names(
+                tmpdir,
+                tensor_name_prefixes=["missing."],
+            )
 
 
 class TestMaybeRemapKvScaleName:

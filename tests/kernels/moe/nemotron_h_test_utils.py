@@ -138,6 +138,7 @@ def get_single_moe_layer_weight_name_map(
 def load_first_nemotron_h_moe_layer_as_single_layer_model(
     checkpoint: str,
     *,
+    tensor_parallel_size: int = 1,
     trust_remote_code: bool = True,
     revision: str | None = None,
     cache_dir: str | None = None,
@@ -176,7 +177,9 @@ def load_first_nemotron_h_moe_layer_as_single_layer_model(
         model_config.hf_text_config = reduced_config
         vllm_config = VllmConfig(
             cache_config=CacheConfig(),
-            parallel_config=ParallelConfig(),
+            parallel_config=ParallelConfig(
+                tensor_parallel_size=tensor_parallel_size,
+            ),
             load_config=LoadConfig(
                 download_dir=cache_dir,
                 use_tqdm_on_load=use_tqdm_on_load,
@@ -189,7 +192,9 @@ def load_first_nemotron_h_moe_layer_as_single_layer_model(
         vllm_config = VllmConfig(
             model_config=model_config,
             cache_config=CacheConfig(),
-            parallel_config=ParallelConfig(),
+            parallel_config=ParallelConfig(
+                tensor_parallel_size=tensor_parallel_size,
+            ),
             load_config=LoadConfig(
                 download_dir=cache_dir,
                 use_tqdm_on_load=use_tqdm_on_load,
@@ -232,12 +237,13 @@ def load_first_nemotron_h_moe_layer_as_single_layer_model(
             safetensors_load_strategy=safetensors_load_strategy,
         )
     )
-    loaded_weight_names = model.load_weights(weights_iter)
-    process_weights_after_loading(
-        model,
-        vllm_config.model_config,
-        torch.device(current_platform.device_type),
-    )
+    with set_current_vllm_config(vllm_config):
+        loaded_weight_names = model.load_weights(weights_iter)
+        process_weights_after_loading(
+            model,
+            vllm_config.model_config,
+            torch.device(current_platform.device_type),
+        )
 
     return NemotronHSingleMoELayerModel(
         model=model,

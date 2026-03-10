@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import queue
 from pathlib import Path
 from types import SimpleNamespace
 
 import huggingface_hub
 import pytest
 import torch
+import torch.multiprocessing as mp
 from safetensors.torch import save_file
 
 from tests.kernels.moe.nemotron_h_test_utils import (
@@ -15,6 +17,7 @@ from tests.kernels.moe.nemotron_h_test_utils import (
     load_first_nemotron_h_moe_layer_as_single_layer_model,
     make_single_moe_layer_nemotron_h_config,
 )
+from tests.utils import ensure_current_vllm_config
 from vllm.config import (
     CacheConfig,
     DeviceConfig,
@@ -23,10 +26,18 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.config.vllm import VllmConfig
+from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.distributed.parallel_state import (
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.models.nemotron_h import NemotronHModel
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs import NemotronHConfig
+from vllm.utils.network_utils import get_open_port
+from vllm.utils.system_utils import update_environment_variables
+from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda_alike(),
@@ -182,60 +193,122 @@ def test_load_first_nemotron_h_moe_layer_as_single_layer_model(tmp_path, dist_in
 @pytest.mark.parametrize(
     "backend", ["flashinfer-latency", "flashinfer-throughput", "triton", "marlin"]
 )
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
 def test_real_nemotron_first_moe_layer_forward(
-    dist_init,
-    workspace_init,
     model_checkpoint: str,
     backend: str,
-    monkeypatch: pytest.MonkeyPatch,
+    tp: int,
 ):
+    if tp > torch.cuda.device_count():
+        pytest.skip(f"Not enough GPUs to run tensor parallel size {tp}")
+
     if ("NVFP4" in model_checkpoint) and not current_platform.supports_nvfp4:
         pytest.skip("Skipping test because NVFP4 is not supported on this platform")
 
-    _set_envs_for_backend(backend, monkeypatch)
+    if backend == "marlin":
+        pytest.skip("Marlin backend is not supported in CI yet.")
 
-    try:
-        result = load_first_nemotron_h_moe_layer_as_single_layer_model(
-            model_checkpoint,
-            trust_remote_code=True,
-        )
-    except Exception as exc:
-        if isinstance(
-            exc,
-            (
-                OSError,
-                RuntimeError,
-                huggingface_hub.errors.HfHubHTTPError,
-                huggingface_hub.errors.LocalEntryNotFoundError,
-            ),
-        ):
-            pytest.skip(f"Failed to load test checkpoint from HF: {exc}")
-        raise
-
-    device = torch.device(current_platform.device_type)
-    model = result.model.to(device)
-    layer = model.layers[0]
-
-    hidden_states = torch.randn(
-        8,
-        result.reduced_config.hidden_size,
-        device=device,
-        dtype=torch.bfloat16,
+    ctx = mp.get_context("spawn")
+    skip_queue = ctx.Queue()
+    mp.spawn(
+        _run_real_nemotron_first_moe_layer_forward,
+        args=(tp, get_open_port(), model_checkpoint, backend, skip_queue),
+        nprocs=tp,
+        join=True,
     )
 
-    with (
-        set_current_vllm_config(result.vllm_config),
-        set_forward_context(
-            None,
-            result.vllm_config,
-            num_tokens=hidden_states.shape[0],
-        ),
-    ):
-        output = layer.mixer(hidden_states)
+    try:
+        status, message = skip_queue.get_nowait()
+    except queue.Empty:
+        return
+    finally:
+        skip_queue.close()
+        skip_queue.join_thread()
 
-    assert output.shape == hidden_states.shape
-    assert torch.isfinite(output).all()
-    assert not torch.all(output == 0)
+    if status == "skip":
+        pytest.skip(message)
+
+    raise AssertionError(message)
+
+
+def _run_real_nemotron_first_moe_layer_forward(
+    local_rank: int,
+    world_size: int,
+    master_port: int,
+    model_checkpoint: str,
+    backend: str,
+    skip_queue: mp.Queue,
+) -> None:
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        update_environment_variables(
+            {
+                "RANK": str(local_rank),
+                "LOCAL_RANK": str(local_rank),
+                "WORLD_SIZE": str(world_size),
+                "MASTER_ADDR": "localhost",
+                "MASTER_PORT": str(master_port),
+            }
+        )
+        _set_envs_for_backend(backend, monkeypatch)
+
+        device = torch.device(f"{current_platform.device_type}:{local_rank}")
+        torch.cuda.set_device(device)
+        init_workspace_manager(device)
+
+        with ensure_current_vllm_config():
+            init_distributed_environment()
+            initialize_model_parallel(tensor_model_parallel_size=world_size)
+
+        try:
+            result = load_first_nemotron_h_moe_layer_as_single_layer_model(
+                model_checkpoint,
+                tensor_parallel_size=world_size,
+                trust_remote_code=True,
+            )
+        except Exception as exc:
+            if isinstance(
+                exc,
+                (
+                    OSError,
+                    RuntimeError,
+                    huggingface_hub.errors.HfHubHTTPError,
+                    huggingface_hub.errors.LocalEntryNotFoundError,
+                ),
+            ):
+                skip_queue.put(
+                    ("skip", f"Failed to load test checkpoint from HF: {exc}")
+                )
+                return
+            raise
+
+        model = result.model.to(device)
+        layer = model.layers[0]
+
+        hidden_states = torch.randn(
+            8,
+            result.reduced_config.hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+        with (
+            set_current_vllm_config(result.vllm_config),
+            set_forward_context(
+                None,
+                result.vllm_config,
+                num_tokens=hidden_states.shape[0],
+            ),
+        ):
+            output = layer.mixer(hidden_states)
+
+        assert output.shape == hidden_states.shape
+        assert torch.isfinite(output).all()
+        assert not torch.all(output == 0)
+    finally:
+        monkeypatch.undo()
+        cleanup_dist_env_and_memory()
+        reset_workspace_manager()
 
 
 def _set_envs_for_backend(backend, monkeypatch: pytest.MonkeyPatch) -> None:

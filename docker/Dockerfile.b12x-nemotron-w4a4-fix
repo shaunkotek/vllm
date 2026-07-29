@@ -1,0 +1,25 @@
+ARG BASE_IMAGE=vllm/vllm-openai@sha256:987393f42c48b8a649961a3484d95d400db184b64e4e1bb7f77cb91536d0f05e
+
+FROM ${BASE_IMAGE} AS patched
+
+ARG VLLM_PATCH_COMMIT=unknown
+
+LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm" \
+      org.opencontainers.image.revision="${VLLM_PATCH_COMMIT}" \
+      org.opencontainers.image.title="vLLM FlashInfer B12x Nemotron W4A4 fix" \
+      ai.vllm.patch.commit="${VLLM_PATCH_COMMIT}" \
+      ai.vllm.patch.base="vllm/vllm-openai@sha256:987393f42c48b8a649961a3484d95d400db184b64e4e1bb7f77cb91536d0f05e"
+
+COPY vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
+
+FROM patched AS test
+
+COPY tests/quantization/test_trtllm_nvfp4_hidden_dim_padding.py \
+    /opt/vllm-tests/test_trtllm_nvfp4_hidden_dim_padding.py
+
+ENTRYPOINT []
+
+FROM patched AS runtime
+
+ENTRYPOINT ["vllm", "serve"]

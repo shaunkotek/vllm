@@ -395,6 +395,9 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
             w13 = torch.nn.functional.pad(w13, (0, 0, 0, pad_size))
             w2 = torch.nn.functional.pad(w2, (0, pad_size // 2, 0, 0))
             w2_scale = torch.nn.functional.pad(w2_scale, (0, pad_size // 16))
+            layer.moe_config.intermediate_size_per_partition = w13.size(1) // (
+                2 if is_gated else 1
+            )
 
         w2_scale = swizzle_blockscale(w2_scale)
 

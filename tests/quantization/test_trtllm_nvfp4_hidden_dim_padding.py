@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
 from vllm.model_executor.layers.quantization.utils import flashinfer_fp4_moe
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
@@ -13,6 +14,98 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     align_trtllm_fp4_moe_hidden_dim_for_fi,
 )
+
+
+def test_b12x_non_gated_intermediate_padding_updates_shared_config(monkeypatch):
+    def fake_swizzle_blockscale(scale: torch.Tensor) -> torch.Tensor:
+        b, m, k = scale.shape
+        return scale.new_empty(
+            (
+                b,
+                (m + 127) // 128 * 128,
+                (k + 3) // 4 * 4,
+            )
+        )
+
+    monkeypatch.setattr(
+        flashinfer_fp4_moe,
+        "swizzle_blockscale",
+        fake_swizzle_blockscale,
+    )
+
+    num_experts = 128
+    hidden_size = 2688
+    intermediate_size = 1856
+    padded_intermediate_size = 1920
+    moe_config = SimpleNamespace(
+        experts_per_token=6,
+        intermediate_size_per_partition=intermediate_size,
+    )
+    layer = SimpleNamespace(
+        activation=MoEActivation.RELU2_NO_MUL,
+        moe_config=moe_config,
+    )
+
+    def prepare():
+        weights_scale_2 = torch.ones(num_experts)
+        return prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+            backend=NvFp4MoeBackend.FLASHINFER_B12X,
+            layer=layer,
+            w13=torch.empty(
+                (num_experts, intermediate_size, hidden_size // 2),
+                dtype=torch.uint8,
+                device="meta",
+            ),
+            w13_scale=torch.empty(
+                (num_experts, intermediate_size, hidden_size // 16),
+                dtype=torch.float8_e4m3fn,
+                device="meta",
+            ),
+            w13_scale_2=weights_scale_2,
+            a13_scale=torch.ones(num_experts),
+            w2=torch.empty(
+                (num_experts, hidden_size, intermediate_size // 2),
+                dtype=torch.uint8,
+                device="meta",
+            ),
+            w2_scale=torch.empty(
+                (num_experts, hidden_size, intermediate_size // 16),
+                dtype=torch.float8_e4m3fn,
+                device="meta",
+            ),
+            w2_scale_2=weights_scale_2,
+            a2_scale=torch.ones(num_experts),
+            is_act_and_mul=False,
+        )
+
+    for _ in range(2):
+        w13, w13_scale, _, _, w2, w2_scale, _, _ = prepare()
+
+        assert w13.shape == (
+            num_experts,
+            padded_intermediate_size,
+            hidden_size // 2,
+        )
+        assert w13_scale.shape == (
+            num_experts,
+            padded_intermediate_size,
+            hidden_size // 16,
+        )
+        assert w2.shape == (
+            num_experts,
+            hidden_size,
+            padded_intermediate_size // 2,
+        )
+        assert w2_scale.shape == (
+            num_experts,
+            hidden_size,
+            padded_intermediate_size // 16,
+        )
+        assert (
+            layer.moe_config.intermediate_size_per_partition == padded_intermediate_size
+        )
+        assert layer.moe_config.experts_per_token == 6
+        assert layer.activation is MoEActivation.RELU2_NO_MUL
 
 
 def test_shared_nvfp4_input_scales_have_writable_storage(monkeypatch):

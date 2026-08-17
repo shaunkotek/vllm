@@ -18,8 +18,11 @@
 # limitations under the License.
 """Inference-only NemotronH model."""
 
+import os
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from itertools import islice
+from typing import Literal, cast
 
 import torch
 from torch import nn
@@ -30,6 +33,7 @@ from vllm.config.parallel import ParallelConfig
 from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -81,6 +85,65 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
+
+_NEMOTRON_H_SCMOE_ENV = "VLLM_NEMOTRON_H_SCMOE"
+
+logger = init_logger(__name__)
+
+_ScMoEOp = Literal["M", "-", "*", "G", "E", "e", "S"]
+
+
+@dataclass(frozen=True)
+class _ScMoEExecutionStep:
+    op: _ScMoEOp
+    layer_idx: int
+    target_layer_idx: int | None = None
+
+
+def _build_scmoe_execution_plan(pattern: str) -> tuple[_ScMoEExecutionStep, ...]:
+    moe_layer_indices = tuple(
+        idx for idx, layer_type in enumerate(pattern) if layer_type == "E"
+    )
+    if not moe_layer_indices:
+        return tuple(
+            _ScMoEExecutionStep(cast(_ScMoEOp, layer_type), idx)
+            for idx, layer_type in enumerate(pattern)
+        )
+
+    atomic_moe_layers = {moe_layer_indices[0]}
+    staged_target_by_source: dict[int, int] = {}
+    for source_idx, target_idx in zip(
+        moe_layer_indices, moe_layer_indices[1:], strict=False
+    ):
+        if "*" in pattern[source_idx + 1 : target_idx]:
+            atomic_moe_layers.add(target_idx)
+        else:
+            staged_target_by_source[source_idx] = target_idx
+
+    steps: list[_ScMoEExecutionStep] = []
+    for layer_idx, layer_type in enumerate(pattern):
+        if layer_type != "E":
+            steps.append(_ScMoEExecutionStep(cast(_ScMoEOp, layer_type), layer_idx))
+            continue
+
+        target_idx = staged_target_by_source.get(layer_idx)
+        if target_idx is not None:
+            steps.append(_ScMoEExecutionStep("G", layer_idx, target_idx))
+        if layer_idx in atomic_moe_layers:
+            steps.append(_ScMoEExecutionStep("E", layer_idx))
+        else:
+            steps.append(_ScMoEExecutionStep("S", layer_idx))
+        if target_idx is not None:
+            steps.append(_ScMoEExecutionStep("e", target_idx))
+
+    return tuple(steps)
+
+
+def _is_scmoe_enabled() -> bool:
+    value = os.getenv(_NEMOTRON_H_SCMOE_ENV, "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"{_NEMOTRON_H_SCMOE_ENV} must be '0' or '1', got {value!r}")
+    return value == "1"
 
 
 class NemotronHMLP(nn.Module):
@@ -229,6 +292,59 @@ class NemotronHMoE(nn.Module):
             router_logits_dtype=self.gate.out_dtype,
         )
 
+    def _prepare_input(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, int, int]:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        if self.is_sequence_parallel:
+            hidden_states = sequence_parallel_chunk(hidden_states)
+        return hidden_states, num_tokens, hidden_dim
+
+    def _restore_output(
+        self,
+        hidden_states: torch.Tensor,
+        num_tokens: int,
+        hidden_dim: int,
+    ) -> torch.Tensor:
+        if self.is_sequence_parallel:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+            hidden_states = hidden_states[:num_tokens]
+        return hidden_states.view(num_tokens, hidden_dim)
+
+    def begin_staged(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, _, _ = self._prepare_input(hidden_states)
+        router_logits, _ = self.gate(hidden_states)
+        return self.experts.begin_staged(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+        )
+
+    def run_staged_experts(
+        self,
+        ticket: torch.Tensor,
+        dependency: torch.Tensor,
+    ) -> torch.Tensor:
+        dependency, _, _ = self._prepare_input(dependency)
+        return self.experts.run_staged_experts(
+            ticket,
+            dependency=dependency,
+        )
+
+    def finish_staged(
+        self,
+        ticket: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states, num_tokens, hidden_dim = self._prepare_input(hidden_states)
+        shared_output = self.experts.run_staged_shared_experts(hidden_states)
+        final_hidden_states = self.experts.finish_staged(
+            ticket,
+            output_template=hidden_states,
+            shared_output=shared_output,
+        )
+        return self._restore_output(final_hidden_states, num_tokens, hidden_dim)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -334,6 +450,18 @@ class NemotronHMoEDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+
+    def normalize(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, residual = self.norm(hidden_states, residual)
+        return hidden_states, residual
 
     def forward(
         self,
@@ -555,6 +683,11 @@ class NemotronHModel(nn.Module, EagleModelMixin):
         parallel_config = vllm_config.parallel_config
 
         self.config = config
+        self.use_scmoe = _is_scmoe_enabled()
+        if self.use_scmoe and get_pp_group().world_size != 1:
+            raise ValueError(
+                f"{_NEMOTRON_H_SCMOE_ENV}=1 does not support pipeline parallelism"
+            )
 
         self.vocab_size = config.vocab_size
 
@@ -588,6 +721,9 @@ class NemotronHModel(nn.Module, EagleModelMixin):
         self.start_layer, self.end_layer, self.layers = make_layers(
             len(config.hybrid_override_pattern), get_layer, prefix=f"{prefix}.layers"
         )
+        self._scmoe_execution_plan = _build_scmoe_execution_plan(
+            config.hybrid_override_pattern
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -596,6 +732,110 @@ class NemotronHModel(nn.Module, EagleModelMixin):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def validate_scmoe_support(self) -> None:
+        if not self.use_scmoe:
+            return
+
+        unsupported_layers = []
+        synchronous_layers = []
+        for step in self._scmoe_execution_plan:
+            if step.op != "S":
+                continue
+            layer_idx = step.layer_idx
+            layer = self.layers[layer_idx]
+            assert isinstance(layer, NemotronHMoEDecoderLayer)
+            if not layer.mixer.experts.supports_staged_execution:
+                unsupported_layers.append(layer_idx)
+            elif not layer.mixer.experts.supports_async_staged_execution:
+                synchronous_layers.append(layer_idx)
+        if unsupported_layers:
+            raise RuntimeError(
+                f"{_NEMOTRON_H_SCMOE_ENV}=1 requires staged modular MoE "
+                f"execution; unsupported layers: {unsupported_layers}"
+            )
+        if synchronous_layers:
+            logger.warning_once(
+                "%s=1 is using staged MoE execution without asynchronous "
+                "dispatch/combine support on layers %s. Expert all-to-all "
+                "communication will not overlap current-path computation.",
+                _NEMOTRON_H_SCMOE_ENV,
+                synchronous_layers,
+            )
+
+    def _forward_scmoe_layers(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        tickets: dict[int, torch.Tensor] = {}
+        prepared_moe_layer_idx: int | None = None
+
+        for step in self._scmoe_execution_plan:
+            layer_idx = step.layer_idx
+            layer = self.layers[layer_idx]
+            if step.op == "G":
+                assert isinstance(layer, NemotronHMoEDecoderLayer)
+                assert prepared_moe_layer_idx is None
+                hidden_states, residual = layer.normalize(hidden_states, residual)
+                prepared_moe_layer_idx = layer_idx
+
+                target_layer_idx = step.target_layer_idx
+                assert target_layer_idx is not None
+                assert target_layer_idx not in tickets
+                target_layer = self.layers[target_layer_idx]
+                assert isinstance(target_layer, NemotronHMoEDecoderLayer)
+                tickets[target_layer_idx] = target_layer.mixer.begin_staged(
+                    hidden_states
+                )
+                continue
+
+            if step.op == "e":
+                assert isinstance(layer, NemotronHMoEDecoderLayer)
+                assert prepared_moe_layer_idx is None
+                ticket = tickets[layer_idx]
+                tickets[layer_idx] = layer.mixer.run_staged_experts(
+                    ticket,
+                    dependency=hidden_states,
+                )
+                continue
+
+            if step.op in ("E", "S"):
+                assert isinstance(layer, NemotronHMoEDecoderLayer)
+                if prepared_moe_layer_idx is None:
+                    hidden_states, residual = layer.normalize(hidden_states, residual)
+                else:
+                    assert prepared_moe_layer_idx == layer_idx
+                    prepared_moe_layer_idx = None
+
+                if step.op == "E":
+                    assert layer_idx not in tickets
+                    hidden_states = layer.mixer(hidden_states)
+                else:
+                    ticket = tickets.pop(layer_idx)
+                    hidden_states = layer.mixer.finish_staged(
+                        ticket,
+                        hidden_states,
+                    )
+            else:
+                assert step.op in ("M", "-", "*")
+                assert prepared_moe_layer_idx is None
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
+
+            local_idx = layer_idx - self.start_layer
+            self._maybe_add_hidden_state(
+                aux_hidden_states, local_idx + 1, hidden_states, residual
+            )
+
+        assert prepared_moe_layer_idx is None
+        assert not tickets
+        return hidden_states, residual
 
     def forward(
         self,
@@ -616,17 +856,25 @@ class NemotronHModel(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
-        ):
-            hidden_states, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
+        if self.use_scmoe:
+            hidden_states, residual = self._forward_scmoe_layers(
+                positions,
+                hidden_states,
+                residual,
+                aux_hidden_states,
             )
-            self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
-            )
+        else:
+            for idx, layer in enumerate(
+                islice(self.layers, self.start_layer, self.end_layer)
+            ):
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
+                self._maybe_add_hidden_state(
+                    aux_hidden_states, idx + 1, hidden_states, residual
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -878,6 +1126,9 @@ class NemotronHForCausalLM(
         )
 
         return hidden_states
+
+    def process_weights_after_loading(self) -> None:
+        self.model.validate_scmoe_support()
 
     def compute_logits(
         self,

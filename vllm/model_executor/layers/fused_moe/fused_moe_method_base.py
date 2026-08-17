@@ -45,6 +45,17 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             self.moe_kernel is not None and self.moe_kernel.can_overlap_shared_experts
         )
 
+    @property
+    def supports_staged_execution(self) -> bool:
+        return self.moe_kernel is not None and self.moe_kernel.supports_staged_execution
+
+    @property
+    def supports_async_staged_execution(self) -> bool:
+        return (
+            self.moe_kernel is not None
+            and self.moe_kernel.supports_async_staged_execution
+        )
+
     @abstractmethod
     def create_weights(
         self,
@@ -184,3 +195,55 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             Output tensor from routed experts
         """
         raise NotImplementedError
+
+    def begin_staged(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> mk.FusedMoEDispatchHandle:
+        """Launch dispatch for a staged modular MoE invocation.
+
+        This API is intended for model adapters with independent computation
+        that can hide dispatch latency. Callers without an overlap opportunity
+        should use the regular atomic MoE forward path.
+        """
+        assert self.moe_kernel is not None
+        return self.moe_kernel.begin_staged(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+        )
+
+    def run_staged_experts(
+        self,
+        handle: mk.FusedMoEDispatchHandle,
+        shared_experts: "SharedExperts | None" = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> mk.FusedMoECombineHandle:
+        """Complete dispatch, execute experts, and launch combine.
+
+        Call this at the model-selected expert boundary, after computation that
+        overlaps dispatch and before computation that overlaps combine.
+        """
+        assert self.moe_kernel is not None
+        return self.moe_kernel.run_staged_experts(
+            handle,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
+        )
+
+    def finish_staged(
+        self,
+        handle: mk.FusedMoECombineHandle,
+    ) -> torch.Tensor:
+        """Wait for staged combine before consuming the routed output."""
+        assert self.moe_kernel is not None
+        return self.moe_kernel.finish_staged(handle)

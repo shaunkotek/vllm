@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import torch
 
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -14,6 +16,24 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
 )
+
+
+@dataclass(frozen=True)
+class MoEDispatchHandle:
+    """Runner state after routing and dispatch have been launched."""
+
+    kernel_handle: mk.FusedMoEDispatchHandle
+    pre_transform_trunc_size: int | None
+    post_transform_trunc_size: int | None
+
+
+@dataclass(frozen=True)
+class MoECombineHandle:
+    """Runner state after expert compute and combine launch."""
+
+    kernel_handle: mk.FusedMoECombineHandle
+    pre_transform_trunc_size: int | None
+    post_transform_trunc_size: int | None
 
 
 class MoERunnerInterface(PluggableLayer, ABC):
@@ -37,6 +57,43 @@ class MoERunnerInterface(PluggableLayer, ABC):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    @property
+    def supports_staged_execution(self) -> bool:
+        return False
+
+    @property
+    def supports_async_staged_execution(self) -> bool:
+        return False
+
+    def begin_staged(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def run_staged_experts(
+        self,
+        ticket: torch.Tensor,
+        dependency: torch.Tensor,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def run_staged_shared_experts(
+        self,
+        shared_experts_input: torch.Tensor,
+    ) -> torch.Tensor | None:
+        raise NotImplementedError
+
+    def finish_staged(
+        self,
+        ticket: torch.Tensor,
+        output_template: torch.Tensor,
+        shared_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 

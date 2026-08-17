@@ -182,3 +182,10 @@ class SharedExperts(torch.nn.Module):
             self._output[self._output_idx] = self._layer(shared_experts_input)
 
         assert self._output[self._output_idx] is not None
+
+    def forward_staged(
+        self,
+        shared_experts_input: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run shared experts synchronously on the caller's compute stream."""
+        return self._layer(shared_experts_input)

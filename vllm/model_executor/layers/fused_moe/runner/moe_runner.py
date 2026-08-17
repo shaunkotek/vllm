@@ -38,6 +38,8 @@ from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
     ZeroExpertRouter,
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
+    MoECombineHandle,
+    MoEDispatchHandle,
     MoERunnerInterface,
 )
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
@@ -50,6 +52,7 @@ from vllm.utils.torch_utils import (
     LayerName,
     direct_register_custom_op,
 )
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 logger = init_logger(__name__)
 
@@ -206,6 +209,98 @@ direct_register_custom_op(
 )
 
 
+def _moe_staged_begin(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    assert isinstance(layer, MoERunner)
+    return layer._begin_staged_forward_impl(
+        hidden_states,
+        router_logits,
+        input_ids=input_ids,
+    )
+
+
+def _moe_staged_begin_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    return hidden_states.new_empty(0)
+
+
+def _moe_staged_experts(
+    ticket: torch.Tensor,
+    dependency: torch.Tensor,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    assert isinstance(layer, MoERunner)
+    return layer._run_staged_experts_forward_impl(ticket, dependency)
+
+
+def _moe_staged_experts_fake(
+    ticket: torch.Tensor,
+    dependency: torch.Tensor,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    return torch.empty_like(ticket)
+
+
+def _moe_staged_finish(
+    ticket: torch.Tensor,
+    output_template: torch.Tensor,
+    shared_output: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    assert isinstance(layer, MoERunner)
+    return layer._finish_staged_forward_impl(
+        ticket,
+        output_template,
+        shared_output,
+    )
+
+
+def _moe_staged_finish_fake(
+    ticket: torch.Tensor,
+    output_template: torch.Tensor,
+    shared_output: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    return torch.empty_like(output_template)
+
+
+direct_register_custom_op(
+    op_name="moe_staged_begin",
+    op_func=_moe_staged_begin,
+    mutates_args=["hidden_states"],
+    fake_impl=_moe_staged_begin_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="moe_staged_experts",
+    op_func=_moe_staged_experts,
+    mutates_args=["dependency"],
+    fake_impl=_moe_staged_experts_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="moe_staged_finish",
+    op_func=_moe_staged_finish,
+    fake_impl=_moe_staged_finish_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 def _unpack(
     result: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
@@ -280,6 +375,14 @@ class MoERunner(MoERunnerInterface):
                 enable_dbo=enable_dbo,
                 mk_can_overlap_shared_experts=can_overlap,
             )
+
+        num_staged_slots = 2 if enable_dbo else 1
+        self._staged_dispatch_handles: list[MoEDispatchHandle | None] = [
+            None
+        ] * num_staged_slots
+        self._staged_combine_handles: list[MoECombineHandle | None] = [
+            None
+        ] * num_staged_slots
 
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
@@ -501,7 +604,7 @@ class MoERunner(MoERunnerInterface):
 
     def _maybe_pad_hidden_states(
         self,
-        shared_experts_input: torch.Tensor | None,
+        shared_experts_hidden_dim: int,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, int | None, int | None]:
         """Pad hidden_states to moe_config.hidden_dim and compute the
@@ -512,9 +615,6 @@ class MoERunner(MoERunnerInterface):
         fused MoE kernel. The returned trunc_size is used by
         _maybe_reduce_final_output to strip the padding from the result.
         """
-        shared_experts_hidden_dim = (
-            shared_experts_input.shape[-1] if shared_experts_input is not None else 0
-        )
         transformed_hidden_dim: int | None = hidden_states.shape[-1]
         if (
             not self._quant_method.skip_forward_padding
@@ -706,7 +806,9 @@ class MoERunner(MoERunnerInterface):
 
         hidden_states, og_hidden_dim_pre_xform, og_hidden_dim_post_xform = (
             self._maybe_pad_hidden_states(
-                shared_experts_input,
+                shared_experts_input.shape[-1]
+                if shared_experts_input is not None
+                else 0,
                 hidden_states,
             )
         )
@@ -722,6 +824,20 @@ class MoERunner(MoERunnerInterface):
             else 0,
         )
 
+        return self._finalize_outputs(
+            result,
+            og_hidden_dim_pre_xform,
+            og_hidden_dim_post_xform,
+        )
+
+    def _finalize_outputs(
+        self,
+        result: torch.Tensor | tuple[torch.Tensor | None, torch.Tensor],
+        pre_transform_trunc_size: int | None,
+        post_transform_trunc_size: int | None,
+    ) -> torch.Tensor:
+        """Apply reductions, transforms, and shared/routed output merging."""
+
         #
         # Note: there are two all-reduce points below. They are mutually
         # exclusive, controlled by _fused_output_is_reduced
@@ -734,8 +850,8 @@ class MoERunner(MoERunnerInterface):
         # Extract outputs from result
         shared_output, fused_output = _unpack(result)
 
-        if og_hidden_dim_pre_xform is not None:
-            fused_output = fused_output[..., :og_hidden_dim_pre_xform]
+        if pre_transform_trunc_size is not None:
+            fused_output = fused_output[..., :pre_transform_trunc_size]
 
         fused_output_is_reduced = self._fused_output_is_reduced
 
@@ -767,10 +883,243 @@ class MoERunner(MoERunnerInterface):
             result = fused_output
 
         result = self._maybe_reduce_final_output(
-            result, og_hidden_dim_post_xform, fused_output_is_reduced
+            result, post_transform_trunc_size, fused_output_is_reduced
         )
 
         return self._maybe_add_zero_expert_output(result)
+
+    @property
+    def supports_staged_execution(self) -> bool:
+        return self.routed_experts.supports_staged_execution
+
+    @property
+    def supports_async_staged_execution(self) -> bool:
+        return self.routed_experts.supports_async_staged_execution
+
+    def _apply_owned_gate(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.gate is None:
+            return router_logits
+        if self._fse_fuse_gate:
+            self._maybe_fuse_gate_weights()
+            return F.linear(hidden_states, self._combined_gate_weight)
+        router_logits, _ = self.gate(hidden_states)
+        return router_logits
+
+    def _staged_layer_name(self) -> str | LayerName:
+        return LayerName(self.layer_name) if _USE_LAYERNAME else self.layer_name
+
+    def begin_staged(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Launch shortcut routing and dispatch through an opaque custom op.
+
+        Use this before independent current-path computation in a
+        shortcut-connected MoE. The returned ticket establishes the compiled
+        graph dependency for :meth:`run_staged_experts`.
+        """
+        return torch.ops.vllm.moe_staged_begin(
+            hidden_states,
+            router_logits,
+            input_ids,
+            self._staged_layer_name(),
+        )
+
+    def run_staged_experts(
+        self,
+        ticket: torch.Tensor,
+        dependency: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run routed experts at the selected model compute boundary.
+
+        ``dependency`` must be the latest current-path tensor computed before
+        this boundary. It keeps the intended order visible to the compiler
+        while dispatch is completed, experts run, and combine is launched.
+        """
+        return torch.ops.vllm.moe_staged_experts(
+            ticket,
+            dependency,
+            self._staged_layer_name(),
+        )
+
+    def finish_staged(
+        self,
+        ticket: torch.Tensor,
+        output_template: torch.Tensor,
+        shared_output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Complete combine and produce the final MoE contribution.
+
+        Call this after the computation intended to overlap combine. A runner
+        with shared experts requires ``shared_output`` computed from the later
+        current-layer activation; the staged runner never infers it from the
+        earlier shortcut input.
+        """
+        return torch.ops.vllm.moe_staged_finish(
+            ticket,
+            output_template,
+            shared_output,
+            self._staged_layer_name(),
+        )
+
+    @property
+    def _staged_slot_idx(self) -> int:
+        return dbo_current_ubatch_id() if self.enable_dbo else 0
+
+    def _begin_staged_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> MoEDispatchHandle:
+        """Route tokens and launch modular MoE dispatch."""
+        if not self.supports_staged_execution:
+            raise RuntimeError(
+                f"MoE layer {self.layer_name!r} does not support staged execution"
+            )
+
+        shared_experts_hidden_dim = (
+            hidden_states.shape[-1] if self._shared_experts is not None else 0
+        )
+        hidden_states, _ = self.apply_routed_input_transform(hidden_states)
+        if self.routed_experts.apply_router_weight_on_input:
+            hidden_states = hidden_states.clone()
+        hidden_states, pre_trunc_size, post_trunc_size = self._maybe_pad_hidden_states(
+            shared_experts_hidden_dim,
+            hidden_states,
+        )
+
+        self.routed_experts._ensure_moe_quant_config_init()
+        router_logits = self._apply_owned_gate(hidden_states, router_logits)
+
+        with self._sequence_parallel_context():
+            hidden_states, router_logits = self._maybe_dispatch(
+                hidden_states,
+                router_logits,
+            )
+            topk_weights, topk_ids = self.router.select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                input_ids=input_ids,
+            )
+            kernel_handle = self.routed_experts.begin_staged(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+            )
+
+        return MoEDispatchHandle(
+            kernel_handle=kernel_handle,
+            pre_transform_trunc_size=pre_trunc_size,
+            post_transform_trunc_size=post_trunc_size,
+        )
+
+    def _run_staged_experts_impl(
+        self,
+        handle: MoEDispatchHandle,
+    ) -> MoECombineHandle:
+        """Complete dispatch, execute experts, and launch combine."""
+        with self._sequence_parallel_context():
+            kernel_handle = self.routed_experts.run_staged_experts(handle.kernel_handle)
+        return MoECombineHandle(
+            kernel_handle=kernel_handle,
+            pre_transform_trunc_size=handle.pre_transform_trunc_size,
+            post_transform_trunc_size=handle.post_transform_trunc_size,
+        )
+
+    def run_staged_shared_experts(
+        self,
+        shared_experts_input: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Execute shared experts on the caller's compute stream."""
+        if self._shared_experts is None:
+            return None
+        return self._shared_experts.forward_staged(shared_experts_input)
+
+    def _finish_staged_impl(
+        self,
+        handle: MoECombineHandle,
+        shared_output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Complete combine and finalize the routed/shared contribution."""
+        if self._shared_experts is not None and shared_output is None:
+            raise ValueError(
+                "finish_staged requires an explicit shared expert output when "
+                "the runner has shared experts"
+            )
+        if self._shared_experts is None and shared_output is not None:
+            raise ValueError(
+                "finish_staged received a shared expert output for a runner "
+                "without shared experts"
+            )
+
+        with self._sequence_parallel_context():
+            fused_output = self.routed_experts.finish_staged(handle.kernel_handle)
+            result = self._maybe_combine(shared_output, fused_output)
+
+        return self._finalize_outputs(
+            result,
+            handle.pre_transform_trunc_size,
+            handle.post_transform_trunc_size,
+        )
+
+    def _begin_staged_forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        idx = self._staged_slot_idx
+        if self._staged_dispatch_handles[idx] is not None:
+            raise RuntimeError(
+                f"MoE layer {self.layer_name!r} already has an active dispatch"
+            )
+        if self._staged_combine_handles[idx] is not None:
+            raise RuntimeError(
+                f"MoE layer {self.layer_name!r} has an unfinished combine"
+            )
+        self._staged_dispatch_handles[idx] = self._begin_staged_impl(
+            hidden_states,
+            router_logits,
+            input_ids=input_ids,
+        )
+        return hidden_states.new_empty(0)
+
+    def _run_staged_experts_forward_impl(
+        self,
+        ticket: torch.Tensor,
+        dependency: torch.Tensor,
+    ) -> torch.Tensor:
+        del dependency
+        idx = self._staged_slot_idx
+        handle = self._staged_dispatch_handles[idx]
+        if handle is None:
+            raise RuntimeError(f"MoE layer {self.layer_name!r} has no active dispatch")
+        self._staged_dispatch_handles[idx] = None
+        self._staged_combine_handles[idx] = self._run_staged_experts_impl(handle)
+        return torch.empty_like(ticket)
+
+    def _finish_staged_forward_impl(
+        self,
+        ticket: torch.Tensor,
+        output_template: torch.Tensor,
+        shared_output: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del ticket, output_template
+        idx = self._staged_slot_idx
+        handle = self._staged_combine_handles[idx]
+        if handle is None:
+            raise RuntimeError(f"MoE layer {self.layer_name!r} has no active combine")
+        result = self._finish_staged_impl(handle, shared_output)
+        self._staged_combine_handles[idx] = None
+        return result
 
     @property
     def do_naive_dispatch_combine(self) -> bool:
@@ -852,15 +1201,8 @@ class MoERunner(MoERunnerInterface):
         # Sync aux and main stream for shared expert multi-stream overlap.
         self._maybe_sync_shared_experts_stream(shared_experts_input)
 
-        # If the Runner holds the gate, apply it after the stream sync,
-        # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
-            if self._fse_fuse_gate:
-                self._maybe_fuse_gate_weights()
-                router_logits = F.linear(hidden_states, self._combined_gate_weight)
-            else:
-                router_logits, _ = self.gate(hidden_states)
+        router_logits = self._apply_owned_gate(hidden_states, router_logits)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once

@@ -52,6 +52,46 @@ The `FusedMoEModularKernel` acts as a bridge between the `FusedMoEExpertsModular
 * `FusedMoEExpertsModular::finalize_weight_and_reduce_impl` method returns `TopKWeightAndReduceNoOp` if the `FusedMoEExpertsModular` implementation does the weight application and reduction itself.
 * `FusedMoEExpertsModular::finalize_weight_and_reduce_impl` method returns `TopKWeightAndReduceContiguous` / `TopKWeightAndReduceNaiveBatched` / `TopKWeightAndReduceDelegate` if the `FusedMoEExpertsModular` implementation needs the `FusedMoEPrepareAndFinalizeModular::finalize()` to do the weight application and reduction.
 
+### Staged execution
+
+Modular kernels can expose dispatch, expert computation, and combine as separate
+execution stages:
+
+```python
+dispatch = kernel.begin_staged(...)
+# Independent compute can run while dispatch is in flight.
+combine = kernel.run_staged_experts(dispatch)
+# Independent compute can run while combine is in flight.
+output = kernel.finish_staged(combine)
+```
+
+`begin_staged` launches asynchronous preparation when the prepare/finalize
+backend supports it. `run_staged_experts` completes dispatch, invokes the
+selected optimized expert implementation, and launches combine.
+`finish_staged` completes combine. The regular `apply` method composes these
+stages immediately and remains the default interface.
+
+Callers should check `supports_staged_execution` before using this interface.
+Modular kernels with synchronous prepare/finalize implementations still support
+the same lifecycle, but do not overlap communication; callers can distinguish
+them with `supports_async_staged_execution`. Monolithic kernels keep using the
+atomic `apply_monolithic` path.
+
+`StagedMoESchedule` describes a fixed expert-compute boundary chosen by a model
+adapter or its configuration. Profiling and boundary-selection policy stay
+outside the kernel and runner because they depend on the model's independent
+compute stages and serving configuration.
+
+The runner's early stages carry only the shortcut/routed input. If the layer has
+shared experts, the caller computes them from the current-layer input and passes
+their output explicitly to `finish_staged`; the runner does not retain or infer
+the shared-expert input from the earlier shortcut activation.
+
+The staged path keeps combine inputs out of the shared workspace because other
+model operators may reuse that workspace while combine is still in flight. At
+the runner level, opaque custom operations carry tensor dependencies between
+the stages so compiled graphs preserve the selected compute boundaries.
+
 ### FusedMoEPrepareAndFinalizeModular
 
 The `FusedMoEPrepareAndFinalizeModular` abstract class exposes `prepare`, `prepare_no_receive`  and `finalize` functions.

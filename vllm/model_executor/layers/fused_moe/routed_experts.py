@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import torch
 
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -1192,6 +1193,48 @@ class RoutedExperts(PluggableLayer):
     #
     # Execution
     #
+
+    @property
+    def supports_staged_execution(self) -> bool:
+        return self.quant_method.supports_staged_execution
+
+    @property
+    def supports_async_staged_execution(self) -> bool:
+        return self.quant_method.supports_async_staged_execution
+
+    def begin_staged(
+        self,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> mk.FusedMoEDispatchHandle:
+        """Launch routed-token dispatch for staged model-level overlap."""
+        return self.quant_method.begin_staged(
+            layer=self,
+            x=x,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+
+    def run_staged_experts(
+        self,
+        handle: mk.FusedMoEDispatchHandle,
+        shared_experts: "SharedExperts | None" = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> mk.FusedMoECombineHandle:
+        """Run experts at the selected boundary and launch combine."""
+        return self.quant_method.run_staged_experts(
+            handle,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
+        )
+
+    def finish_staged(
+        self,
+        handle: mk.FusedMoECombineHandle,
+    ) -> torch.Tensor:
+        """Wait for combine and return the staged routed-expert output."""
+        return self.quant_method.finish_staged(handle)
 
     def forward_modular(
         self,

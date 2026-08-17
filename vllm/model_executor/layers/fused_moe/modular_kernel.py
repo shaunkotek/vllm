@@ -173,6 +173,39 @@ PrepareMonolithicResultType = tuple[
 
 ReceiverType = Callable[[], PrepareResultType]
 
+
+@dataclass(frozen=True)
+class FusedMoEDispatchHandle:
+    """State produced after launching the dispatch stage of a modular MoE."""
+
+    hidden_states: torch.Tensor
+    output: torch.Tensor
+    w1: torch.Tensor
+    w2: torch.Tensor
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    activation: MoEActivation
+    global_num_experts: int
+    local_num_experts: int
+    expert_map: torch.Tensor | None
+    apply_router_weight_on_input: bool
+    prepare_result: PrepareResultType | None
+    completion_hook: Callable | None
+    receiver: ReceiverType | None
+
+
+@dataclass(frozen=True)
+class FusedMoECombineHandle:
+    """State produced after experts run and combine has been launched."""
+
+    output: torch.Tensor
+    fused_out: torch.Tensor
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    completion_hook: Callable | None
+    receiver: Callable | None
+
+
 ################################################################################
 # Prepare/Finalize
 ################################################################################
@@ -1116,6 +1149,7 @@ class FusedMoEKernelModularImpl:
         local_num_experts: int,
         expert_tokens_meta: ExpertTokensMetadata | None,
         activation: MoEActivation,
+        persistent_output: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Allocate temporary and output buffers for the fused experts op.
@@ -1153,16 +1187,27 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
-        # We can reuse the memory between cache1 and cache3 because by the
-        # time we need cache3, we're done with cache1.
-        # Reuse workspace13 for the output since there is only one chunk.
-        max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
-        common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
-            ((max_shape_size,), workspace_dtype),
-            (workspace2_shape, workspace_dtype),
-        )
-        workspace13 = _resize_cache(common_workspace, workspace13_shape)
-        fused_out = _resize_cache(common_workspace, fused_out_shape)
+        if persistent_output:
+            workspace13, workspace2 = current_workspace_manager().get_simultaneous(
+                (workspace13_shape, workspace_dtype),
+                (workspace2_shape, workspace_dtype),
+            )
+            fused_out = torch.empty(
+                fused_out_shape,
+                dtype=workspace_dtype,
+                device=device,
+            )
+        else:
+            # We can reuse the memory between cache1 and cache3 because by the
+            # time we need cache3, we're done with cache1.
+            # Reuse workspace13 for the output since there is only one chunk.
+            max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+            common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
+                ((max_shape_size,), workspace_dtype),
+                (workspace2_shape, workspace_dtype),
+            )
+            workspace13 = _resize_cache(common_workspace, workspace13_shape)
+            fused_out = _resize_cache(common_workspace, fused_out_shape)
 
         return workspace13, workspace2, fused_out
 
@@ -1179,6 +1224,100 @@ class FusedMoEKernelModularImpl:
                 SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
             )
 
+    @staticmethod
+    def _unpack_async_result(
+        result: tuple[Callable, Callable] | Callable,
+    ) -> tuple[Callable | None, Callable]:
+        return result if isinstance(result, tuple) else (None, result)
+
+    @staticmethod
+    def _complete_async(
+        completion_hook: Callable | None,
+        receiver: Callable,
+    ):
+        if completion_hook is not None:
+            if dbo_enabled():
+                dbo_register_recv_hook(completion_hook)
+                dbo_yield()
+            else:
+                completion_hook()
+        return receiver()
+
+    def _launch_prepare(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> tuple[
+        PrepareResultType | None,
+        Callable | None,
+        ReceiverType | None,
+    ]:
+        if not self.prepare_finalize.supports_async():
+            assert not dbo_enabled()
+            prepare_result = self.prepare_finalize.prepare(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                global_num_experts,
+                expert_map,
+                apply_router_weight_on_input,
+                self.fused_experts.quant_config,
+                defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+            )
+            return prepare_result, None, None
+
+        dbo_maybe_run_recv_hook()
+        prepare_ret = self.prepare_finalize.prepare_async(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            global_num_experts,
+            expert_map,
+            apply_router_weight_on_input,
+            self.fused_experts.quant_config,
+            defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+        )
+        hook, receiver = self._unpack_async_result(prepare_ret)
+        return None, hook, receiver
+
+    def _complete_prepare(
+        self,
+        prepare_result: PrepareResultType | None,
+        completion_hook: Callable | None,
+        receiver: ReceiverType | None,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        ExpertTokensMetadata | None,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        if prepare_result is None:
+            assert receiver is not None
+            prepare_result = self._complete_async(completion_hook, receiver)
+
+        (
+            a1q,
+            a1q_scale,
+            expert_tokens_meta,
+            expert_topk_ids,
+            expert_topk_weights,
+        ) = prepare_result
+
+        # Maybe prepare gathered topk_ids and topk_weights from other EP ranks.
+        topk_ids = topk_ids if expert_topk_ids is None else expert_topk_ids
+        topk_weights = (
+            topk_weights if expert_topk_weights is None else expert_topk_weights
+        )
+
+        return a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights
+
     def _prepare(
         self,
         hidden_states: torch.Tensor,
@@ -1194,79 +1333,41 @@ class FusedMoEKernelModularImpl:
         torch.Tensor,
         torch.Tensor,
     ]:
+        """Run dispatch preparation to completion.
+
+        This blocking helper preserves the original non-staged prepare
+        contract. It wraps both synchronous prepare/finalize backends and
+        asynchronous backends, including their DBO completion hooks, and
+        returns only after dispatched expert inputs are available.
+
+        Args:
+            hidden_states: Local token activations before expert dispatch.
+            topk_weights: Router weights for each selected expert.
+            topk_ids: Selected global expert IDs.
+            global_num_experts: Number of experts in the global expert space.
+            expert_map: Optional global-to-local expert mapping.
+            apply_router_weight_on_input: Whether routing weights are applied
+                before expert computation.
+
+        Returns:
+            Dispatched activations, optional activation scales, optional expert
+            token metadata, and the expert-local top-k IDs and weights.
         """
-        The _prepare method is a wrapper around self.prepare_finalize.prepare
-        that handles DBO and async.
-        """
-
-        if not self.prepare_finalize.supports_async():
-            # We shouldn't be running an a2a kernel that doesn't
-            # support async prepare/finalize
-            # TODO(lucas): enable in follow-up
-            assert not dbo_enabled()
-
-            (
-                a1q,
-                a1q_scale,
-                expert_tokens_meta,
-                _expert_topk_ids,
-                _expert_topk_weights,
-            ) = self.prepare_finalize.prepare(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                global_num_experts,
-                expert_map,
-                apply_router_weight_on_input,
-                self.fused_experts.quant_config,
-                defer_input_quant=self.fused_experts.expects_unquantized_inputs,
-            )
-        else:
-            # Overlap shared expert compute with all2all dispatch.
-            dbo_maybe_run_recv_hook()
-            prepare_ret = self.prepare_finalize.prepare_async(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                global_num_experts,
-                expert_map,
-                apply_router_weight_on_input,
-                self.fused_experts.quant_config,
-                defer_input_quant=self.fused_experts.expects_unquantized_inputs,
-            )
-
-            # TODO(lucas): refactor this in the alternative schedules followup
-            # currently unpack if we have hook + receiver pair or just
-            # receiver (see finalize_async docstring)
-            hook, receiver = (
-                prepare_ret if isinstance(prepare_ret, tuple) else (None, prepare_ret)
-            )
-
-            if hook is not None:
-                if dbo_enabled():
-                    # If DBO is being used, register the hook with the ubatch
-                    # context and call it in dbo_maybe_run_recv_hook instead of
-                    #  passing it to the receiver.
-                    dbo_register_recv_hook(hook)
-                    dbo_yield()
-                else:
-                    hook()
-
-            (
-                a1q,
-                a1q_scale,
-                expert_tokens_meta,
-                _expert_topk_ids,
-                _expert_topk_weights,
-            ) = receiver()
-
-        # Maybe prepare gathered topk_ids and topk_weights from other EP ranks.
-        topk_ids = topk_ids if _expert_topk_ids is None else _expert_topk_ids
-        topk_weights = (
-            topk_weights if _expert_topk_weights is None else _expert_topk_weights
+        prepare_result, hook, receiver = self._launch_prepare(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            global_num_experts,
+            expert_map,
+            apply_router_weight_on_input,
         )
-
-        return a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights
+        return self._complete_prepare(
+            prepare_result,
+            hook,
+            receiver,
+            topk_weights,
+            topk_ids,
+        )
 
     def _fused_experts(
         self,
@@ -1284,6 +1385,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
         output_alias: torch.Tensor | None = None,
+        persistent_output: bool = False,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1310,6 +1412,7 @@ class FusedMoEKernelModularImpl:
             local_num_experts,
             expert_tokens_meta,
             activation,
+            persistent_output=persistent_output,
         )
 
         use_output_alias = (
@@ -1352,6 +1455,47 @@ class FusedMoEKernelModularImpl:
 
         return fused_out
 
+    def _launch_finalize(
+        self,
+        output: torch.Tensor,
+        fused_out: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        shared_experts: SharedExperts | None,
+        shared_experts_input: torch.Tensor | None,
+    ) -> tuple[Callable | None, Callable | None]:
+        if not self.prepare_finalize.supports_async():
+            assert not dbo_enabled()
+            self.prepare_finalize.finalize(
+                output,
+                fused_out,
+                topk_weights,
+                topk_ids,
+                apply_router_weight_on_input,
+                self.fused_experts.finalize_weight_and_reduce_impl(),
+            )
+            return None, None
+
+        finalize_ret = self.prepare_finalize.finalize_async(
+            output,
+            fused_out,
+            topk_weights,
+            topk_ids,
+            apply_router_weight_on_input,
+            self.fused_experts.finalize_weight_and_reduce_impl(),
+        )
+        self._maybe_apply_shared_experts(shared_experts, shared_experts_input)
+        return self._unpack_async_result(finalize_ret)
+
+    def _complete_finalize(
+        self,
+        completion_hook: Callable | None,
+        receiver: Callable | None,
+    ) -> None:
+        if receiver is not None:
+            self._complete_async(completion_hook, receiver)
+
     def _finalize(
         self,
         output: torch.Tensor,
@@ -1363,62 +1507,221 @@ class FusedMoEKernelModularImpl:
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        """
-        The _finalize method is a wrapper around self.prepare_finalize.finalize
-        that handles DBO, async and shared expert overlap.
+        """Run output combine to completion.
+
+        This blocking helper preserves the original non-staged finalize
+        contract. It starts the backend's combine operation, handles DBO
+        completion hooks, and waits until ``output`` is ready. The optional
+        shared-expert arguments preserve the existing modular-kernel overlap
+        used by atomic MoE execution; shortcut-connected model adapters instead
+        compute their later shared-expert input outside this method.
 
         Args:
-            shared_experts: SharedExperts | None. The shared experts if any.
-            shared_experts_input: Optional separate input for shared experts.
-                When latent MoE is used, hidden_states is the latent-projected
-                tensor (smaller dimension) used by routed experts, while
-                shared_experts_input is the original hidden_states (full
-                dimension) needed by the shared expert MLP.
+            output: Destination tensor for the combined routed-expert result.
+            fused_out: Local routed-expert output before backend finalization.
+            hidden_states: Original routed input retained for API compatibility.
+            topk_weights: Top-k weights corresponding to ``fused_out``.
+            topk_ids: Top-k expert IDs corresponding to ``fused_out``.
+            apply_router_weight_on_input: Whether routing weights were applied
+                before expert computation.
+            shared_experts: Optional shared-expert runner for legacy internal
+                overlap with asynchronous combine.
+            shared_experts_input: Input for ``shared_experts`` when that overlap
+                is requested.
+
+        Returns:
+            ``output`` after combine has completed.
         """
-        if not self.prepare_finalize.supports_async():
-            assert not dbo_enabled()
-
-            self.prepare_finalize.finalize(
-                output,
-                fused_out,
-                topk_weights,
-                topk_ids,
-                apply_router_weight_on_input,
-                self.fused_experts.finalize_weight_and_reduce_impl(),
-            )
-        else:
-            finalize_ret = self.prepare_finalize.finalize_async(
-                output,
-                fused_out,
-                topk_weights,
-                topk_ids,
-                apply_router_weight_on_input,
-                self.fused_experts.finalize_weight_and_reduce_impl(),
-            )
-            self._maybe_apply_shared_experts(shared_experts, shared_experts_input)
-
-            # TODO(lucas): refactor this in the alternative schedules followup
-            # currently unpack if we have hook + receiver pair or just
-            # receiver (see finalize_async docstring)
-            hook, receiver = (
-                finalize_ret
-                if isinstance(finalize_ret, tuple)
-                else (None, finalize_ret)
-            )
-
-            if hook is not None:
-                if dbo_enabled():
-                    # If DBO is being used, register the hook with the ubatch
-                    # context and call it in dbo_maybe_run_recv_hook instead of
-                    #  passing it to the receiver.
-                    dbo_register_recv_hook(hook)
-                    dbo_yield()
-                else:
-                    hook()
-
-            receiver()
+        del hidden_states
+        hook, receiver = self._launch_finalize(
+            output,
+            fused_out,
+            topk_weights,
+            topk_ids,
+            apply_router_weight_on_input,
+            shared_experts,
+            shared_experts_input,
+        )
+        self._complete_finalize(hook, receiver)
 
         return output
+
+    def begin_staged(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        activation: MoEActivation = MoEActivation.SILU,
+        global_num_experts: int = -1,
+        expert_map: torch.Tensor | None = None,
+        apply_router_weight_on_input: bool = False,
+    ) -> FusedMoEDispatchHandle:
+        """Start a staged MoE invocation by launching expert dispatch.
+
+        Use this method only when the caller has independent model computation
+        to execute between dispatch and expert computation, as in a
+        shortcut-connected MoE. Callers without such work should use
+        :meth:`apply`, which executes the same lifecycle atomically. An
+        asynchronous prepare/finalize backend can overlap dispatch with the
+        caller's computation; a synchronous backend still follows this API but
+        completes dispatch before returning.
+
+        The returned handle owns the invocation state and must be consumed once
+        by :meth:`run_staged_experts`.
+
+        Args:
+            hidden_states: Routed or shortcut token activations.
+            w1: First expert projection weights.
+            w2: Second expert projection weights.
+            topk_ids: Selected global expert IDs.
+            topk_weights: Router weights for each selected expert.
+            activation: Activation between expert projections.
+            global_num_experts: Number of experts in the global expert space.
+            expert_map: Optional global-to-local expert mapping.
+            apply_router_weight_on_input: Whether routing weights are applied
+                before expert computation.
+
+        Returns:
+            A handle representing an in-flight or completed dispatch.
+        """
+        output = torch.empty_like(hidden_states)
+        local_num_experts = w1.shape[0]
+        if global_num_experts == -1:
+            global_num_experts = local_num_experts
+
+        prepare_result, hook, receiver = self._launch_prepare(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            global_num_experts,
+            expert_map,
+            apply_router_weight_on_input,
+        )
+        return FusedMoEDispatchHandle(
+            hidden_states=hidden_states,
+            output=output,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            local_num_experts=local_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            prepare_result=prepare_result,
+            completion_hook=hook,
+            receiver=receiver,
+        )
+
+    def run_staged_experts(
+        self,
+        handle: FusedMoEDispatchHandle,
+        shared_experts: SharedExperts | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+        persistent_output: bool = True,
+    ) -> FusedMoECombineHandle:
+        """Cross the staged expert boundary and launch output combine.
+
+        Call this after the independent computation intended to hide dispatch
+        latency. It waits for dispatch if necessary, executes the configured
+        optimized expert kernel, then starts the prepare/finalize backend's
+        combine operation. The returned handle must be consumed once by
+        :meth:`finish_staged` after any computation intended to hide combine
+        latency.
+
+        ``shared_experts`` is available for the atomic modular-kernel path's
+        existing internal overlap. Shortcut-connected model adapters normally
+        leave it unset because their shared-expert input becomes available only
+        later in the model path.
+
+        Args:
+            handle: Handle returned by :meth:`begin_staged`.
+            shared_experts: Optional shared-expert runner to overlap internally.
+            shared_experts_input: Input for ``shared_experts``.
+            persistent_output: Allocate the expert result outside reusable MoE
+                workspace when asynchronous combine may outlive this call.
+
+        Returns:
+            A handle representing an in-flight or completed combine.
+        """
+        (
+            a1q,
+            a1q_scale,
+            expert_tokens_meta,
+            topk_ids,
+            topk_weights,
+        ) = self._complete_prepare(
+            handle.prepare_result,
+            handle.completion_hook,
+            handle.receiver,
+            handle.topk_weights,
+            handle.topk_ids,
+        )
+
+        lora_ctx = getattr(self.fused_experts, "_lora_context", None)
+        if lora_ctx is not None:
+            lora_ctx.original_hidden_states = handle.hidden_states
+        try:
+            fused_out = self._fused_experts(
+                in_dtype=handle.hidden_states.dtype,
+                a1q=a1q,
+                a1q_scale=a1q_scale,
+                w1=handle.w1,
+                w2=handle.w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=handle.activation,
+                global_num_experts=handle.global_num_experts,
+                local_num_experts=handle.local_num_experts,
+                expert_map=handle.expert_map,
+                apply_router_weight_on_input=(handle.apply_router_weight_on_input),
+                expert_tokens_meta=expert_tokens_meta,
+                output_alias=handle.output,
+                persistent_output=(
+                    persistent_output and self.prepare_finalize.supports_async()
+                ),
+            )
+        finally:
+            if lora_ctx is not None:
+                lora_ctx.original_hidden_states = None
+
+        hook, receiver = self._launch_finalize(
+            handle.output,
+            fused_out,
+            topk_weights,
+            topk_ids,
+            handle.apply_router_weight_on_input,
+            shared_experts,
+            shared_experts_input,
+        )
+        return FusedMoECombineHandle(
+            output=handle.output,
+            fused_out=fused_out,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            completion_hook=hook,
+            receiver=receiver,
+        )
+
+    def finish_staged(self, handle: FusedMoECombineHandle) -> torch.Tensor:
+        """Wait for staged combine and return the routed-expert output.
+
+        Call this after all independent computation intended to overlap the
+        combine operation. This is the synchronization point that makes the
+        routed-expert result safe to consume. Each handle returned by
+        :meth:`run_staged_experts` must be finished exactly once.
+
+        Args:
+            handle: Handle returned by :meth:`run_staged_experts`.
+
+        Returns:
+            The combined routed-expert output.
+        """
+        self._complete_finalize(handle.completion_hook, handle.receiver)
+        return handle.output
 
     def apply(
         self,
@@ -1462,58 +1765,24 @@ class FusedMoEKernelModularImpl:
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
-        output = torch.empty_like(hidden_states)
-
-        local_num_experts = w1.shape[0]
-        if global_num_experts == -1:
-            global_num_experts = local_num_experts
-
-        a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
+        dispatch_handle = self.begin_staged(
             hidden_states,
-            topk_weights,
+            w1,
+            w2,
             topk_ids,
-            global_num_experts,
-            expert_map,
-            apply_router_weight_on_input,
-        )
-
-        # Stash the original unquantized hidden states on the LoRA context
-        # so apply_w13_lora sees correct-magnitude activations instead of
-        # the potentially quantized values produced by _prepare().
-        lora_ctx = getattr(self.fused_experts, "_lora_context", None)
-        if lora_ctx is not None:
-            lora_ctx.original_hidden_states = hidden_states
-
-        fused_out = self._fused_experts(
-            in_dtype=hidden_states.dtype,
-            a1q=a1q,
-            a1q_scale=a1q_scale,
-            w1=w1,
-            w2=w2,
             topk_weights=topk_weights,
-            topk_ids=topk_ids,
             activation=activation,
             global_num_experts=global_num_experts,
-            local_num_experts=local_num_experts,
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            expert_tokens_meta=expert_tokens_meta,
-            output_alias=output,
         )
-
-        if lora_ctx is not None:
-            lora_ctx.original_hidden_states = None
-
-        return self._finalize(
-            output,
-            fused_out,
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            apply_router_weight_on_input,
+        combine_handle = self.run_staged_experts(
+            dispatch_handle,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            persistent_output=False,
         )
+        return self.finish_staged(combine_handle)
 
 
 @final
@@ -1621,6 +1890,14 @@ class FusedMoEKernel:
             return False
 
     @property
+    def supports_staged_execution(self) -> bool:
+        return isinstance(self.impl, FusedMoEKernelModularImpl)
+
+    @property
+    def supports_async_staged_execution(self) -> bool:
+        return self.supports_staged_execution and self.prepare_finalize.supports_async()
+
+    @property
     def is_monolithic(self) -> bool:
         return isinstance(self.impl, FusedMoEKernelMonolithicImpl)
 
@@ -1717,3 +1994,55 @@ class FusedMoEKernel:
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+
+    def begin_staged(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> FusedMoEDispatchHandle:
+        """Launch dispatch for a staged modular MoE invocation.
+
+        Use with independent model computation between this method,
+        :meth:`run_staged_experts`, and :meth:`finish_staged`. Use
+        :meth:`apply` when no such overlap opportunity exists.
+        """
+        assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        return self.impl.begin_staged(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+
+    def run_staged_experts(
+        self,
+        handle: FusedMoEDispatchHandle,
+        shared_experts: SharedExperts | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+        persistent_output: bool = True,
+    ) -> FusedMoECombineHandle:
+        """Complete staged dispatch, run experts, and launch combine."""
+        assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        return self.impl.run_staged_experts(
+            handle,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
+            persistent_output=persistent_output,
+        )
+
+    def finish_staged(self, handle: FusedMoECombineHandle) -> torch.Tensor:
+        """Complete staged combine and make its output safe to consume."""
+        assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        return self.impl.finish_staged(handle)

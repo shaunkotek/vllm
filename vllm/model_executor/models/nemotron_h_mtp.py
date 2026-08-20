@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, VllmConfig, replace
 from vllm.config.parallel import ParallelConfig
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -309,6 +309,25 @@ class NemotronHMultiTokenPredictor(nn.Module):
         return hidden_states
 
 
+def _get_mtp_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
+    target_hf_config = vllm_config.model_config.hf_config
+    if getattr(target_hf_config, "image_token_index", None) is None:
+        image_token_index = getattr(target_hf_config, "img_context_token_id", None)
+        if image_token_index is not None:
+            target_hf_config.image_token_index = image_token_index
+
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is not None
+        and speculative_config.draft_model_config is not None
+    ):
+        return replace(
+            vllm_config,
+            model_config=speculative_config.draft_model_config,
+        )
+    return vllm_config
+
+
 class NemotronHMTP(nn.Module, SupportsPP):
     """NemotronH MTP model."""
 
@@ -322,6 +341,7 @@ class NemotronHMTP(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        vllm_config = _get_mtp_vllm_config(vllm_config)
         config = vllm_config.model_config.hf_config
         self.vllm_config = vllm_config
         self.config = config

@@ -59,9 +59,9 @@ execution stages:
 
 ```python
 dispatch = kernel.begin_staged(...)
-# Independent compute can run while dispatch is in flight.
+# Caller-controlled work can run while dispatch is in flight.
 combine = kernel.run_staged_experts(dispatch)
-# Independent compute can run while combine is in flight.
+# Caller-controlled work can run while combine is in flight.
 output = kernel.finish_staged(combine)
 ```
 
@@ -71,21 +71,21 @@ selected optimized expert implementation, and launches combine.
 `finish_staged` completes combine. The regular `apply` method composes these
 stages immediately and remains the default interface.
 
+Staged execution is useful when a caller needs explicit control over these
+boundaries. Shortcut-connected MoE is the primary use case, but the interface
+does not prescribe the work performed between stages. Callers that do not need
+to control the boundaries should use `apply`.
+
 Callers should check `supports_staged_execution` before using this interface.
 Modular kernels with synchronous prepare/finalize implementations still support
 the same lifecycle, but do not overlap communication; callers can distinguish
 them with `supports_async_staged_execution`. Monolithic kernels keep using the
 atomic `apply_monolithic` path.
 
-`StagedMoESchedule` describes a fixed expert-compute boundary chosen by a model
-adapter or its configuration. Profiling and boundary-selection policy stay
-outside the kernel and runner because they depend on the model's independent
-compute stages and serving configuration.
-
-The runner's early stages carry only the shortcut/routed input. If the layer has
-shared experts, the caller computes them from the current-layer input and passes
-their output explicitly to `finish_staged`; the runner does not retain or infer
-the shared-expert input from the earlier shortcut activation.
+Shared experts are controlled explicitly in staged execution. Their input may
+be the routed-expert input or a different activation, and the caller chooses
+when to compute them. The caller passes their output to `finish_staged`; the
+runner does not retain or infer the shared-expert input.
 
 The staged path keeps combine inputs out of the shared workspace because other
 model operators may reuse that workspace while combine is still in flight. At
@@ -94,8 +94,18 @@ the stages so compiled graphs preserve the selected compute boundaries.
 
 ### FusedMoEPrepareAndFinalizeModular
 
-The `FusedMoEPrepareAndFinalizeModular` abstract class exposes `prepare`, `prepare_no_receive`  and `finalize` functions.
-The `prepare` function is responsible for input activation Quantization and All2All Dispatch. If implemented, The `prepare_no_receive` is like `prepare` except it does not wait to receive results from other workers.  Instead it returns a "receiver" callback that must be invoked to wait for the final results of worker. It is not required that this method is supported by all `FusedMoEPrepareAndFinalizeModular` classes, but if it is available, it can be used to interleave work with the initial all to all communication, e.g. interleaving shared experts with fused experts.  The `finalize` function is responsible for invoking the All2All Combine. Additionally the `finalize` function may or may not do the TopK weight application and reduction (Please refer to the TopKWeightAndReduce section)
+The `FusedMoEPrepareAndFinalizeModular` abstract class exposes `prepare`,
+`prepare_async`, `finalize`, and `finalize_async`. Preparation performs input
+activation quantization and any All2All dispatch. Finalization performs any
+All2All combine and may also apply TopK weights and reduction.
+
+The asynchronous methods launch their operation without making its result
+ready for immediate consumption. They return a receiver callback, optionally
+paired with a lightweight completion hook. The completion hook waits for or
+progresses communication completion. The receiver then materializes the
+dispatch result or makes the combine output ready. A backend may capture result
+tensors in the receiver closure or write into an output tensor supplied when
+the operation was launched.
 
 ![FusedMoEPrepareAndFinalizeModular Blocks](../assets/design/fused_moe_modular_kernel/prepare_and_finalize_blocks.png)
 

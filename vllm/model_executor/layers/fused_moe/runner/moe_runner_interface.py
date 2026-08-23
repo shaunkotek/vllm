@@ -78,8 +78,8 @@ class MoERunnerInterface(PluggableLayer, ABC):
 
     def run_staged_experts(
         self,
-        ticket: torch.Tensor,
-        dependency: torch.Tensor,
+        dispatch_dependency: torch.Tensor,
+        current_path_output: torch.Tensor,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -91,7 +91,7 @@ class MoERunnerInterface(PluggableLayer, ABC):
 
     def finish_staged(
         self,
-        ticket: torch.Tensor,
+        combine_dependency: torch.Tensor,
         output_template: torch.Tensor,
         shared_output: torch.Tensor | None = None,
     ) -> torch.Tensor:

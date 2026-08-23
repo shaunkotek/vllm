@@ -1333,12 +1333,11 @@ class FusedMoEKernelModularImpl:
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Run dispatch preparation to completion.
+        """Run the default blocking dispatch preparation path.
 
-        This blocking helper preserves the original non-staged prepare
-        contract. It wraps both synchronous prepare/finalize backends and
-        asynchronous backends, including their DBO completion hooks, and
-        returns only after dispatched expert inputs are available.
+        This helper supports synchronous and asynchronous prepare/finalize
+        backends, including DBO completion hooks, and returns only after
+        dispatched expert inputs are available.
 
         Args:
             hidden_states: Local token activations before expert dispatch.
@@ -1507,14 +1506,11 @@ class FusedMoEKernelModularImpl:
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Run output combine to completion.
+        """Run the default blocking output finalization path.
 
-        This blocking helper preserves the original non-staged finalize
-        contract. It starts the backend's combine operation, handles DBO
-        completion hooks, and waits until ``output`` is ready. The optional
-        shared-expert arguments preserve the existing modular-kernel overlap
-        used by atomic MoE execution; shortcut-connected model adapters instead
-        compute their later shared-expert input outside this method.
+        This helper starts the backend's combine operation, handles DBO
+        completion hooks, and waits until ``output`` is ready. Optional shared
+        experts may run while an asynchronous combine is in flight.
 
         Args:
             output: Destination tensor for the combined routed-expert result.
@@ -1524,8 +1520,8 @@ class FusedMoEKernelModularImpl:
             topk_ids: Top-k expert IDs corresponding to ``fused_out``.
             apply_router_weight_on_input: Whether routing weights were applied
                 before expert computation.
-            shared_experts: Optional shared-expert runner for legacy internal
-                overlap with asynchronous combine.
+            shared_experts: Optional shared-expert runner to overlap with an
+                asynchronous combine.
             shared_experts_input: Input for ``shared_experts`` when that overlap
                 is requested.
 
@@ -1560,19 +1556,19 @@ class FusedMoEKernelModularImpl:
     ) -> FusedMoEDispatchHandle:
         """Start a staged MoE invocation by launching expert dispatch.
 
-        Use this method only when the caller has independent model computation
-        to execute between dispatch and expert computation, as in a
-        shortcut-connected MoE. Callers without such work should use
-        :meth:`apply`, which executes the same lifecycle atomically. An
-        asynchronous prepare/finalize backend can overlap dispatch with the
-        caller's computation; a synchronous backend still follows this API but
-        completes dispatch before returning.
+        Use staged execution when the caller needs explicit control over the
+        dispatch, expert-compute, and combine boundaries. Shortcut-connected
+        MoE is the primary use case. Callers that do not need to control these
+        boundaries should use :meth:`apply`, which composes the same lifecycle.
+        An asynchronous prepare/finalize backend can overlap dispatch with work
+        scheduled by the caller; a synchronous backend completes dispatch
+        before returning.
 
         The returned handle owns the invocation state and must be consumed once
         by :meth:`run_staged_experts`.
 
         Args:
-            hidden_states: Routed or shortcut token activations.
+            hidden_states: Token activations for routed experts.
             w1: First expert projection weights.
             w2: Second expert projection weights.
             topk_ids: Selected global expert IDs.
@@ -1625,17 +1621,15 @@ class FusedMoEKernelModularImpl:
     ) -> FusedMoECombineHandle:
         """Cross the staged expert boundary and launch output combine.
 
-        Call this after the independent computation intended to hide dispatch
-        latency. It waits for dispatch if necessary, executes the configured
-        optimized expert kernel, then starts the prepare/finalize backend's
-        combine operation. The returned handle must be consumed once by
-        :meth:`finish_staged` after any computation intended to hide combine
-        latency.
+        Call this at the caller-selected expert-compute boundary. It waits for
+        dispatch if necessary, executes the configured optimized expert kernel,
+        then starts the prepare/finalize backend's combine operation. The
+        returned handle must be consumed once by :meth:`finish_staged`.
 
-        ``shared_experts`` is available for the atomic modular-kernel path's
-        existing internal overlap. Shortcut-connected model adapters normally
-        leave it unset because their shared-expert input becomes available only
-        later in the model path.
+        If shared experts should run at this boundary, ``shared_experts_input``
+        may be the routed-expert input or a different activation. A caller may
+        instead compute shared experts outside the modular kernel and combine
+        their result at a higher layer.
 
         Args:
             handle: Handle returned by :meth:`begin_staged`.
@@ -1709,10 +1703,10 @@ class FusedMoEKernelModularImpl:
     def finish_staged(self, handle: FusedMoECombineHandle) -> torch.Tensor:
         """Wait for staged combine and return the routed-expert output.
 
-        Call this after all independent computation intended to overlap the
-        combine operation. This is the synchronization point that makes the
-        routed-expert result safe to consume. Each handle returned by
-        :meth:`run_staged_experts` must be finished exactly once.
+        Call this when the caller is ready to consume the routed-expert result.
+        This is the synchronization point that makes the result safe to use.
+        Each handle returned by :meth:`run_staged_experts` must be finished
+        exactly once.
 
         Args:
             handle: Handle returned by :meth:`run_staged_experts`.
@@ -2009,9 +2003,9 @@ class FusedMoEKernel:
     ) -> FusedMoEDispatchHandle:
         """Launch dispatch for a staged modular MoE invocation.
 
-        Use with independent model computation between this method,
-        :meth:`run_staged_experts`, and :meth:`finish_staged`. Use
-        :meth:`apply` when no such overlap opportunity exists.
+        Use this interface when the caller needs explicit control over the
+        dispatch, expert-compute, and combine boundaries. Use :meth:`apply` for
+        the regular composed execution path.
         """
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
         return self.impl.begin_staged(

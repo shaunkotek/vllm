@@ -205,9 +205,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> mk.FusedMoEDispatchHandle:
         """Launch dispatch for a staged modular MoE invocation.
 
-        This API is intended for model adapters with independent computation
-        that can hide dispatch latency. Callers without an overlap opportunity
-        should use the regular atomic MoE forward path.
+        Use this API when a model adapter needs explicit control over dispatch,
+        expert-compute, and combine boundaries. Shortcut-connected MoE is the
+        primary use case. Other callers should use the regular MoE forward path.
         """
         assert self.moe_kernel is not None
         return self.moe_kernel.begin_staged(
@@ -230,8 +230,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> mk.FusedMoECombineHandle:
         """Complete dispatch, execute experts, and launch combine.
 
-        Call this at the model-selected expert boundary, after computation that
-        overlaps dispatch and before computation that overlaps combine.
+        Call this at the model-selected expert boundary. It completes dispatch,
+        runs the configured expert kernel, and launches combine.
         """
         assert self.moe_kernel is not None
         return self.moe_kernel.run_staged_experts(

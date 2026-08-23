@@ -322,24 +322,24 @@ class NemotronHMoE(nn.Module):
 
     def run_staged_experts(
         self,
-        ticket: torch.Tensor,
-        dependency: torch.Tensor,
+        dispatch_dependency: torch.Tensor,
+        current_path_output: torch.Tensor,
     ) -> torch.Tensor:
-        dependency, _, _ = self._prepare_input(dependency)
+        current_path_output, _, _ = self._prepare_input(current_path_output)
         return self.experts.run_staged_experts(
-            ticket,
-            dependency=dependency,
+            dispatch_dependency,
+            current_path_output=current_path_output,
         )
 
     def finish_staged(
         self,
-        ticket: torch.Tensor,
+        combine_dependency: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states, num_tokens, hidden_dim = self._prepare_input(hidden_states)
         shared_output = self.experts.run_staged_shared_experts(hidden_states)
         final_hidden_states = self.experts.finish_staged(
-            ticket,
+            combine_dependency,
             output_template=hidden_states,
             shared_output=shared_output,
         )
@@ -684,6 +684,7 @@ class NemotronHModel(nn.Module, EagleModelMixin):
 
         self.config = config
         self.use_scmoe = _is_scmoe_enabled()
+        self._scmoe_enable_dbo = parallel_config.enable_dbo
         if self.use_scmoe and get_pp_group().world_size != 1:
             raise ValueError(
                 f"{_NEMOTRON_H_SCMOE_ENV}=1 does not support pipeline parallelism"
@@ -754,6 +755,12 @@ class NemotronHModel(nn.Module, EagleModelMixin):
                 f"{_NEMOTRON_H_SCMOE_ENV}=1 requires staged modular MoE "
                 f"execution; unsupported layers: {unsupported_layers}"
             )
+        if synchronous_layers and self._scmoe_enable_dbo:
+            raise RuntimeError(
+                f"{_NEMOTRON_H_SCMOE_ENV}=1 with DBO requires asynchronous "
+                "staged MoE execution; synchronous layers: "
+                f"{synchronous_layers}"
+            )
         if synchronous_layers:
             logger.warning_once(
                 "%s=1 is using staged MoE execution without asynchronous "
@@ -770,7 +777,7 @@ class NemotronHModel(nn.Module, EagleModelMixin):
         residual: torch.Tensor | None,
         aux_hidden_states: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        tickets: dict[int, torch.Tensor] = {}
+        stage_dependencies: dict[int, torch.Tensor] = {}
         prepared_moe_layer_idx: int | None = None
 
         for step in self._scmoe_execution_plan:
@@ -784,10 +791,10 @@ class NemotronHModel(nn.Module, EagleModelMixin):
 
                 target_layer_idx = step.target_layer_idx
                 assert target_layer_idx is not None
-                assert target_layer_idx not in tickets
+                assert target_layer_idx not in stage_dependencies
                 target_layer = self.layers[target_layer_idx]
                 assert isinstance(target_layer, NemotronHMoEDecoderLayer)
-                tickets[target_layer_idx] = target_layer.mixer.begin_staged(
+                stage_dependencies[target_layer_idx] = target_layer.mixer.begin_staged(
                     hidden_states
                 )
                 continue
@@ -795,10 +802,10 @@ class NemotronHModel(nn.Module, EagleModelMixin):
             if step.op == "e":
                 assert isinstance(layer, NemotronHMoEDecoderLayer)
                 assert prepared_moe_layer_idx is None
-                ticket = tickets[layer_idx]
-                tickets[layer_idx] = layer.mixer.run_staged_experts(
-                    ticket,
-                    dependency=hidden_states,
+                dispatch_dependency = stage_dependencies[layer_idx]
+                stage_dependencies[layer_idx] = layer.mixer.run_staged_experts(
+                    dispatch_dependency,
+                    current_path_output=hidden_states,
                 )
                 continue
 
@@ -811,12 +818,12 @@ class NemotronHModel(nn.Module, EagleModelMixin):
                     prepared_moe_layer_idx = None
 
                 if step.op == "E":
-                    assert layer_idx not in tickets
+                    assert layer_idx not in stage_dependencies
                     hidden_states = layer.mixer(hidden_states)
                 else:
-                    ticket = tickets.pop(layer_idx)
+                    combine_dependency = stage_dependencies.pop(layer_idx)
                     hidden_states = layer.mixer.finish_staged(
-                        ticket,
+                        combine_dependency,
                         hidden_states,
                     )
             else:
@@ -834,7 +841,7 @@ class NemotronHModel(nn.Module, EagleModelMixin):
             )
 
         assert prepared_moe_layer_idx is None
-        assert not tickets
+        assert not stage_dependencies
         return hidden_states, residual
 
     def forward(

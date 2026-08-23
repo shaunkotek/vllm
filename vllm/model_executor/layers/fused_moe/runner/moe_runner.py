@@ -234,25 +234,27 @@ def _moe_staged_begin_fake(
 
 
 def _moe_staged_experts(
-    ticket: torch.Tensor,
-    dependency: torch.Tensor,
+    dispatch_dependency: torch.Tensor,
+    current_path_output: torch.Tensor,
     layer_name: _layer_name_type,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     assert isinstance(layer, MoERunner)
-    return layer._run_staged_experts_forward_impl(ticket, dependency)
+    return layer._run_staged_experts_forward_impl(
+        dispatch_dependency, current_path_output
+    )
 
 
 def _moe_staged_experts_fake(
-    ticket: torch.Tensor,
-    dependency: torch.Tensor,
+    dispatch_dependency: torch.Tensor,
+    current_path_output: torch.Tensor,
     layer_name: _layer_name_type,
 ) -> torch.Tensor:
-    return torch.empty_like(ticket)
+    return torch.empty_like(dispatch_dependency)
 
 
 def _moe_staged_finish(
-    ticket: torch.Tensor,
+    combine_dependency: torch.Tensor,
     output_template: torch.Tensor,
     shared_output: torch.Tensor | None,
     layer_name: _layer_name_type,
@@ -260,14 +262,14 @@ def _moe_staged_finish(
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     assert isinstance(layer, MoERunner)
     return layer._finish_staged_forward_impl(
-        ticket,
+        combine_dependency,
         output_template,
         shared_output,
     )
 
 
 def _moe_staged_finish_fake(
-    ticket: torch.Tensor,
+    combine_dependency: torch.Tensor,
     output_template: torch.Tensor,
     shared_output: torch.Tensor | None,
     layer_name: _layer_name_type,
@@ -287,7 +289,7 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="moe_staged_experts",
     op_func=_moe_staged_experts,
-    mutates_args=["dependency"],
+    mutates_args=["current_path_output"],
     fake_impl=_moe_staged_experts_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
@@ -918,11 +920,12 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Launch shortcut routing and dispatch through an opaque custom op.
+        """Launch routing and dispatch through an opaque custom op.
 
-        Use this before independent current-path computation in a
-        shortcut-connected MoE. The returned ticket establishes the compiled
-        graph dependency for :meth:`run_staged_experts`.
+        The returned dummy dependency preserves ordering with
+        :meth:`run_staged_experts` in the compiled graph. Shortcut-connected
+        MoE is the primary use case for placing caller-controlled work between
+        these operations.
         """
         return torch.ops.vllm.moe_staged_begin(
             hidden_states,
@@ -933,36 +936,42 @@ class MoERunner(MoERunnerInterface):
 
     def run_staged_experts(
         self,
-        ticket: torch.Tensor,
-        dependency: torch.Tensor,
+        dispatch_dependency: torch.Tensor,
+        current_path_output: torch.Tensor,
     ) -> torch.Tensor:
         """Run routed experts at the selected model compute boundary.
 
-        ``dependency`` must be the latest current-path tensor computed before
-        this boundary. It keeps the intended order visible to the compiler
-        while dispatch is completed, experts run, and combine is launched.
+        ``dispatch_dependency`` is the dummy dependency returned by
+        :meth:`begin_staged`. ``current_path_output`` must be the latest model
+        tensor computed before this boundary. Declaring it as mutated keeps the
+        intended order visible to the compiler. The returned dummy dependency
+        preserves ordering with :meth:`finish_staged`.
         """
         return torch.ops.vllm.moe_staged_experts(
-            ticket,
-            dependency,
+            dispatch_dependency,
+            current_path_output,
             self._staged_layer_name(),
         )
 
     def finish_staged(
         self,
-        ticket: torch.Tensor,
+        combine_dependency: torch.Tensor,
         output_template: torch.Tensor,
         shared_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Complete combine and produce the final MoE contribution.
 
-        Call this after the computation intended to overlap combine. A runner
-        with shared experts requires ``shared_output`` computed from the later
-        current-layer activation; the staged runner never infers it from the
-        earlier shortcut input.
+        ``combine_dependency`` is the dummy dependency returned by
+        :meth:`run_staged_experts`. The runtime implementation does not consume
+        values from ``output_template``; the fake implementation uses it to
+        describe the result's shape, dtype, device, and layout. Passing it also
+        preserves ordering with the model computation that produced it.
+
+        A runner with shared experts requires an explicit ``shared_output``.
+        The shared-expert input may be the routed input or a different tensor.
         """
         return torch.ops.vllm.moe_staged_finish(
-            ticket,
+            combine_dependency,
             output_template,
             shared_output,
             self._staged_layer_name(),
@@ -1094,25 +1103,25 @@ class MoERunner(MoERunnerInterface):
 
     def _run_staged_experts_forward_impl(
         self,
-        ticket: torch.Tensor,
-        dependency: torch.Tensor,
+        dispatch_dependency: torch.Tensor,
+        current_path_output: torch.Tensor,
     ) -> torch.Tensor:
-        del dependency
+        del current_path_output
         idx = self._staged_slot_idx
         handle = self._staged_dispatch_handles[idx]
         if handle is None:
             raise RuntimeError(f"MoE layer {self.layer_name!r} has no active dispatch")
         self._staged_dispatch_handles[idx] = None
         self._staged_combine_handles[idx] = self._run_staged_experts_impl(handle)
-        return torch.empty_like(ticket)
+        return torch.empty_like(dispatch_dependency)
 
     def _finish_staged_forward_impl(
         self,
-        ticket: torch.Tensor,
+        combine_dependency: torch.Tensor,
         output_template: torch.Tensor,
         shared_output: torch.Tensor | None,
     ) -> torch.Tensor:
-        del ticket, output_template
+        del combine_dependency, output_template
         idx = self._staged_slot_idx
         handle = self._staged_combine_handles[idx]
         if handle is None:

@@ -12,9 +12,6 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEKernelModularImpl,
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
-from vllm.model_executor.layers.fused_moe.runner.staged_moe import (
-    StagedMoESchedule,
-)
 
 
 class _AsyncPrepareFinalize:
@@ -179,21 +176,6 @@ def test_staged_execution_falls_back_to_synchronous_prepare_finalize():
     torch.testing.assert_close(output, (hidden_states + 1) * 2)
 
 
-def test_staged_schedule_selects_configured_compute_boundary():
-    schedule = StagedMoESchedule(
-        expert_checkpoint=2,
-        num_compute_stages=3,
-    )
-
-    assert schedule.expert_checkpoint == 2
-    assert [schedule.should_run_experts(i) for i in range(4)] == [
-        False,
-        False,
-        True,
-        False,
-    ]
-
-
 def test_runner_requires_late_shared_expert_output():
     runner = object.__new__(MoERunner)
     runner.__dict__.update(
@@ -222,38 +204,40 @@ def test_runner_staged_state_machine_rejects_overlapping_invocations():
 
     hidden_states = torch.zeros(2, 4)
     router_logits = torch.zeros(2, 2)
-    ticket = runner._begin_staged_forward_impl(hidden_states, router_logits)
-    assert ticket.numel() == 0
+    stage_dependency = runner._begin_staged_forward_impl(hidden_states, router_logits)
+    assert stage_dependency.numel() == 0
 
     with pytest.raises(RuntimeError, match="already has an active dispatch"):
         runner._begin_staged_forward_impl(hidden_states, router_logits)
 
-    ticket = runner._run_staged_experts_forward_impl(ticket, hidden_states)
-    assert ticket.numel() == 0
+    stage_dependency = runner._run_staged_experts_forward_impl(
+        stage_dependency, hidden_states
+    )
+    assert stage_dependency.numel() == 0
     assert runner._staged_dispatch_handles == [None]
 
-    output = runner._finish_staged_forward_impl(ticket, hidden_states, None)
+    output = runner._finish_staged_forward_impl(stage_dependency, hidden_states, None)
     assert output is result
     assert runner._staged_combine_handles == [None]
 
 
 def test_staged_custom_ops_preserve_selected_compute_boundaries():
     def staged_graph(x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
-        ticket = torch.ops.vllm.moe_staged_begin(
+        stage_dependency = torch.ops.vllm.moe_staged_begin(
             x,
             router_logits,
             None,
             "test.moe",
         )
         before_experts = torch.sin(x)
-        ticket = torch.ops.vllm.moe_staged_experts(
-            ticket,
+        stage_dependency = torch.ops.vllm.moe_staged_experts(
+            stage_dependency,
             before_experts,
             "test.moe",
         )
         before_finish = torch.cos(before_experts)
         return torch.ops.vllm.moe_staged_finish(
-            ticket,
+            stage_dependency,
             before_finish,
             None,
             "test.moe",

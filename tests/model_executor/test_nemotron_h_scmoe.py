@@ -37,19 +37,26 @@ class _FakeMoE(nn.Module):
 
     def run_staged_experts(
         self,
-        ticket: torch.Tensor,
-        dependency: torch.Tensor,
+        dispatch_dependency: torch.Tensor,
+        current_path_output: torch.Tensor,
     ) -> torch.Tensor:
-        self.events.append(("experts", self.name, dependency.item(), ticket.item()))
-        return ticket
+        self.events.append(
+            (
+                "experts",
+                self.name,
+                current_path_output.item(),
+                dispatch_dependency.item(),
+            )
+        )
+        return dispatch_dependency
 
     def finish_staged(
         self,
-        ticket: torch.Tensor,
+        combine_dependency: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         self.events.append(("shared", self.name, hidden_states.item()))
-        self.events.append(("finish", self.name, ticket.item()))
+        self.events.append(("finish", self.name, combine_dependency.item()))
         return hidden_states + 200
 
 
@@ -114,6 +121,7 @@ def _make_model(layers: list[nn.Module], pattern: str) -> NemotronHModel:
     model.start_layer = 0
     model.end_layer = len(layers)
     model._scmoe_execution_plan = _build_scmoe_execution_plan(pattern)
+    model._scmoe_enable_dbo = False
     model.aux_hidden_state_layers = ()
     model.do_not_compile = True
     return model
@@ -232,15 +240,15 @@ def test_nemotron_moe_staged_wrapper_orders_shared_expert_between_custom_ops():
             events.append(("begin", kwargs["hidden_states"].shape))
             return kwargs["hidden_states"].new_empty(0)
 
-        def run_staged_experts(self, ticket, dependency):
-            events.append(("experts", dependency.shape))
-            return ticket
+        def run_staged_experts(self, dispatch_dependency, current_path_output):
+            events.append(("experts", current_path_output.shape))
+            return dispatch_dependency
 
         def run_staged_shared_experts(self, hidden_states):
             events.append(("shared", hidden_states.shape))
             return hidden_states + 1
 
-        def finish_staged(self, ticket, output_template, shared_output):
+        def finish_staged(self, combine_dependency, output_template, shared_output):
             events.append(("finish", output_template.shape))
             return shared_output + 1
 
@@ -248,9 +256,9 @@ def test_nemotron_moe_staged_wrapper_orders_shared_expert_between_custom_ops():
     moe.experts = _Experts()
     hidden_states = torch.zeros((3, 4))
 
-    ticket = moe.begin_staged(hidden_states)
-    ticket = moe.run_staged_experts(ticket, hidden_states)
-    output = moe.finish_staged(ticket, hidden_states)
+    stage_dependency = moe.begin_staged(hidden_states)
+    stage_dependency = moe.run_staged_experts(stage_dependency, hidden_states)
+    output = moe.finish_staged(stage_dependency, hidden_states)
 
     assert events == [
         ("gate", torch.Size([3, 4])),
@@ -289,3 +297,17 @@ def test_scmoe_warns_when_staged_layer_is_synchronous():
         [1],
     )
     assert "will not overlap" in warning_once.call_args.args[0]
+
+
+def test_scmoe_rejects_synchronous_staged_layer_with_dbo():
+    layers = [_FakeMoELayer("E0", []), _FakeMoELayer("E1", [])]
+    layers[1].mixer.experts.supports_async_staged_execution = False
+    model = _make_model(layers, "EE")
+    model.use_scmoe = True
+    model._scmoe_enable_dbo = True
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"DBO requires asynchronous staged MoE execution.*\[1\]",
+    ):
+        model.validate_scmoe_support()

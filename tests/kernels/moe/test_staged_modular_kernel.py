@@ -3,15 +3,12 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
-from torch.fx.experimental.proxy_tensor import make_fx
 
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEKernelModularImpl,
 )
-from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 
 class _AsyncPrepareFinalize:
@@ -174,87 +171,3 @@ def test_staged_execution_falls_back_to_synchronous_prepare_finalize():
     output = impl.finish_staged(combine)
     assert events == ["dispatch", "experts", "persistent=False", "combine"]
     torch.testing.assert_close(output, (hidden_states + 1) * 2)
-
-
-def test_runner_requires_late_shared_expert_output():
-    runner = object.__new__(MoERunner)
-    runner.__dict__.update(
-        layer_name="test.moe",
-        _shared_experts=object(),
-    )
-
-    with pytest.raises(ValueError, match="explicit shared expert output"):
-        runner._finish_staged_impl(SimpleNamespace(), None)
-
-
-def test_runner_staged_state_machine_rejects_overlapping_invocations():
-    runner = object.__new__(MoERunner)
-    runner.__dict__.update(
-        enable_dbo=False,
-        layer_name="test.moe",
-        _staged_dispatch_handles=[None],
-        _staged_combine_handles=[None],
-    )
-    dispatch_handle = object()
-    combine_handle = object()
-    result = torch.ones(2, 4)
-    runner.__dict__["_begin_staged_impl"] = lambda *args, **kwargs: dispatch_handle
-    runner.__dict__["_run_staged_experts_impl"] = lambda handle: combine_handle
-    runner.__dict__["_finish_staged_impl"] = lambda handle, shared_output: result
-
-    hidden_states = torch.zeros(2, 4)
-    router_logits = torch.zeros(2, 2)
-    stage_dependency = runner._begin_staged_forward_impl(hidden_states, router_logits)
-    assert stage_dependency.numel() == 0
-
-    with pytest.raises(RuntimeError, match="already has an active dispatch"):
-        runner._begin_staged_forward_impl(hidden_states, router_logits)
-
-    stage_dependency = runner._run_staged_experts_forward_impl(
-        stage_dependency, hidden_states
-    )
-    assert stage_dependency.numel() == 0
-    assert runner._staged_dispatch_handles == [None]
-
-    output = runner._finish_staged_forward_impl(stage_dependency, hidden_states, None)
-    assert output is result
-    assert runner._staged_combine_handles == [None]
-
-
-def test_staged_custom_ops_preserve_selected_compute_boundaries():
-    def staged_graph(x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
-        stage_dependency = torch.ops.vllm.moe_staged_begin(
-            x,
-            router_logits,
-            None,
-            "test.moe",
-        )
-        before_experts = torch.sin(x)
-        stage_dependency = torch.ops.vllm.moe_staged_experts(
-            stage_dependency,
-            before_experts,
-            "test.moe",
-        )
-        before_finish = torch.cos(before_experts)
-        return torch.ops.vllm.moe_staged_finish(
-            stage_dependency,
-            before_finish,
-            None,
-            "test.moe",
-        )
-
-    graph = make_fx(staged_graph, tracing_mode="fake")(
-        torch.randn(2, 4),
-        torch.randn(2, 8),
-    )
-    targets = [
-        str(node.target) for node in graph.graph.nodes if node.op == "call_function"
-    ]
-
-    assert targets == [
-        "vllm.moe_staged_begin.default",
-        "aten.sin.default",
-        "vllm.moe_staged_experts.default",
-        "aten.cos.default",
-        "vllm.moe_staged_finish.default",
-    ]

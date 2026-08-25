@@ -126,14 +126,15 @@ def _build_scmoe_execution_plan(pattern: str) -> tuple[_ScMoEExecutionStep, ...]
             steps.append(_ScMoEExecutionStep(cast(_ScMoEOp, layer_type), layer_idx))
             continue
 
+        if layer_idx in atomic_moe_layers:
+            steps.append(_ScMoEExecutionStep("E", layer_idx))
+            continue
+
         target_idx = staged_target_by_source.get(layer_idx)
         if target_idx is not None:
             steps.append(_ScMoEExecutionStep("G", layer_idx, target_idx))
-        if layer_idx in atomic_moe_layers:
-            steps.append(_ScMoEExecutionStep("E", layer_idx))
-        else:
+            # Shared experts of current layer are the MLP equvielant
             steps.append(_ScMoEExecutionStep("S", layer_idx))
-        if target_idx is not None:
             steps.append(_ScMoEExecutionStep("e", target_idx))
 
     return tuple(steps)
@@ -296,7 +297,6 @@ class NemotronHMoE(nn.Module):
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, int, int]:
         num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
         return hidden_states, num_tokens, hidden_dim
@@ -684,7 +684,7 @@ class NemotronHModel(nn.Module, EagleModelMixin):
 
         self.config = config
         self.use_scmoe = _is_scmoe_enabled()
-        self._scmoe_enable_dbo = parallel_config.enable_dbo
+        self._scmoe_enable_dbo = self.use_scmoe and parallel_config.enable_dbo
         if self.use_scmoe and get_pp_group().world_size != 1:
             raise ValueError(
                 f"{_NEMOTRON_H_SCMOE_ENV}=1 does not support pipeline parallelism"

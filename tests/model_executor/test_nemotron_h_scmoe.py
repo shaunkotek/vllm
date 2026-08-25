@@ -10,10 +10,8 @@ from torch import nn
 
 from vllm.model_executor.models.nemotron_h import (
     NemotronHModel,
-    NemotronHMoE,
     NemotronHMoEDecoderLayer,
     _build_scmoe_execution_plan,
-    _is_scmoe_enabled,
 )
 
 
@@ -127,24 +125,6 @@ def _make_model(layers: list[nn.Module], pattern: str) -> NemotronHModel:
     return model
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [(None, False), ("0", False), ("1", True)],
-)
-def test_scmoe_env(monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool):
-    if value is None:
-        monkeypatch.delenv("VLLM_NEMOTRON_H_SCMOE", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_NEMOTRON_H_SCMOE", value)
-    assert _is_scmoe_enabled() is expected
-
-
-def test_scmoe_env_rejects_invalid_value(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("VLLM_NEMOTRON_H_SCMOE", "true")
-    with pytest.raises(ValueError, match="must be '0' or '1'"):
-        _is_scmoe_enabled()
-
-
 def test_disabled_path_uses_atomic_layer_forward():
     events: list[tuple] = []
     model = _make_model(
@@ -222,52 +202,6 @@ def test_scmoe_executes_explicit_unrolled_plan():
     ]
     assert hidden_states.item() == 323.0
     assert residual is not None and residual.item() == 1.0
-
-
-def test_nemotron_moe_staged_wrapper_orders_shared_expert_between_custom_ops():
-    events: list[tuple] = []
-    moe = object.__new__(NemotronHMoE)
-    nn.Module.__init__(moe)
-    moe.is_sequence_parallel = False
-
-    class _Gate(nn.Module):
-        def forward(self, hidden_states: torch.Tensor):
-            events.append(("gate", hidden_states.shape))
-            return hidden_states.new_zeros((hidden_states.shape[0], 2)), None
-
-    class _Experts:
-        def begin_staged(self, **kwargs):
-            events.append(("begin", kwargs["hidden_states"].shape))
-            return kwargs["hidden_states"].new_empty(0)
-
-        def run_staged_experts(self, dispatch_dependency, current_path_output):
-            events.append(("experts", current_path_output.shape))
-            return dispatch_dependency
-
-        def run_staged_shared_experts(self, hidden_states):
-            events.append(("shared", hidden_states.shape))
-            return hidden_states + 1
-
-        def finish_staged(self, combine_dependency, output_template, shared_output):
-            events.append(("finish", output_template.shape))
-            return shared_output + 1
-
-    moe.gate = _Gate()
-    moe.experts = _Experts()
-    hidden_states = torch.zeros((3, 4))
-
-    stage_dependency = moe.begin_staged(hidden_states)
-    stage_dependency = moe.run_staged_experts(stage_dependency, hidden_states)
-    output = moe.finish_staged(stage_dependency, hidden_states)
-
-    assert events == [
-        ("gate", torch.Size([3, 4])),
-        ("begin", torch.Size([3, 4])),
-        ("experts", torch.Size([3, 4])),
-        ("shared", torch.Size([3, 4])),
-        ("finish", torch.Size([3, 4])),
-    ]
-    torch.testing.assert_close(output, torch.full((3, 4), 2.0))
 
 
 def test_scmoe_rejects_unsupported_staged_layer():

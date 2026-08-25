@@ -190,7 +190,7 @@ class FusedMoEDispatchHandle:
     expert_map: torch.Tensor | None
     apply_router_weight_on_input: bool
     prepare_result: PrepareResultType | None
-    completion_hook: Callable | None
+    recv_hook: Callable | None
     receiver: ReceiverType | None
 
 
@@ -202,7 +202,7 @@ class FusedMoECombineHandle:
     fused_out: torch.Tensor
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
-    completion_hook: Callable | None
+    recv_hook: Callable | None
     receiver: Callable | None
 
 
@@ -1232,15 +1232,15 @@ class FusedMoEKernelModularImpl:
 
     @staticmethod
     def _complete_async(
-        completion_hook: Callable | None,
+        recv_hook: Callable | None,
         receiver: Callable,
     ):
-        if completion_hook is not None:
+        if recv_hook is not None:
             if dbo_enabled():
-                dbo_register_recv_hook(completion_hook)
+                dbo_register_recv_hook(recv_hook)
                 dbo_yield()
             else:
-                completion_hook()
+                recv_hook()
         return receiver()
 
     def _launch_prepare(
@@ -1281,13 +1281,13 @@ class FusedMoEKernelModularImpl:
             self.fused_experts.quant_config,
             defer_input_quant=self.fused_experts.expects_unquantized_inputs,
         )
-        hook, receiver = self._unpack_async_result(prepare_ret)
-        return None, hook, receiver
+        recv_hook, receiver = self._unpack_async_result(prepare_ret)
+        return None, recv_hook, receiver
 
     def _complete_prepare(
         self,
         prepare_result: PrepareResultType | None,
-        completion_hook: Callable | None,
+        recv_hook: Callable | None,
         receiver: ReceiverType | None,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -1300,7 +1300,7 @@ class FusedMoEKernelModularImpl:
     ]:
         if prepare_result is None:
             assert receiver is not None
-            prepare_result = self._complete_async(completion_hook, receiver)
+            prepare_result = self._complete_async(recv_hook, receiver)
 
         (
             a1q,
@@ -1489,11 +1489,11 @@ class FusedMoEKernelModularImpl:
 
     def _complete_finalize(
         self,
-        completion_hook: Callable | None,
+        recv_hook: Callable | None,
         receiver: Callable | None,
     ) -> None:
         if receiver is not None:
-            self._complete_async(completion_hook, receiver)
+            self._complete_async(recv_hook, receiver)
 
     def _finalize(
         self,
@@ -1509,7 +1509,7 @@ class FusedMoEKernelModularImpl:
         """Run the default blocking output finalization path.
 
         This helper starts the backend's combine operation, handles DBO
-        completion hooks, and waits until ``output`` is ready. Optional shared
+        receive hooks, and waits until ``output`` is ready. Optional shared
         experts may run while an asynchronous combine is in flight.
 
         Args:
@@ -1529,7 +1529,7 @@ class FusedMoEKernelModularImpl:
             ``output`` after combine has completed.
         """
         del hidden_states
-        hook, receiver = self._launch_finalize(
+        recv_hook, receiver = self._launch_finalize(
             output,
             fused_out,
             topk_weights,
@@ -1538,7 +1538,7 @@ class FusedMoEKernelModularImpl:
             shared_experts,
             shared_experts_input,
         )
-        self._complete_finalize(hook, receiver)
+        self._complete_finalize(recv_hook, receiver)
 
         return output
 
@@ -1587,7 +1587,7 @@ class FusedMoEKernelModularImpl:
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        prepare_result, hook, receiver = self._launch_prepare(
+        prepare_result, recv_hook, receiver = self._launch_prepare(
             hidden_states,
             topk_weights,
             topk_ids,
@@ -1608,7 +1608,7 @@ class FusedMoEKernelModularImpl:
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             prepare_result=prepare_result,
-            completion_hook=hook,
+            recv_hook=recv_hook,
             receiver=receiver,
         )
 
@@ -1649,7 +1649,7 @@ class FusedMoEKernelModularImpl:
             topk_weights,
         ) = self._complete_prepare(
             handle.prepare_result,
-            handle.completion_hook,
+            handle.recv_hook,
             handle.receiver,
             handle.topk_weights,
             handle.topk_ids,
@@ -1682,7 +1682,7 @@ class FusedMoEKernelModularImpl:
             if lora_ctx is not None:
                 lora_ctx.original_hidden_states = None
 
-        hook, receiver = self._launch_finalize(
+        recv_hook, receiver = self._launch_finalize(
             handle.output,
             fused_out,
             topk_weights,
@@ -1696,7 +1696,7 @@ class FusedMoEKernelModularImpl:
             fused_out=fused_out,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            completion_hook=hook,
+            recv_hook=recv_hook,
             receiver=receiver,
         )
 
@@ -1714,7 +1714,7 @@ class FusedMoEKernelModularImpl:
         Returns:
             The combined routed-expert output.
         """
-        self._complete_finalize(handle.completion_hook, handle.receiver)
+        self._complete_finalize(handle.recv_hook, handle.receiver)
         return handle.output
 
     def apply(

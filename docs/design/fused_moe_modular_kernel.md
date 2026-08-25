@@ -100,9 +100,9 @@ activation quantization and any All2All dispatch. Finalization performs any
 All2All combine and may also apply TopK weights and reduction.
 
 The asynchronous methods launch their operation without making its result
-ready for immediate consumption. They return a receiver callback, optionally
-paired with a lightweight completion hook. The completion hook waits for or
-progresses communication completion. The receiver then materializes the
+ready for immediate consumption. They return a `receiver` callback, optionally
+paired with a lightweight `recv_hook`. The `recv_hook` waits for or progresses
+communication completion. The `receiver` then materializes the
 dispatch result or makes the combine output ready. A backend may capture result
 tensors in the receiver closure or write into an output tensor supplied when
 the operation was launched.
